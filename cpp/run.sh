@@ -1,2 +1,1 @@
-clang++ -std=c++23 -O2 -Wall -fsanitize=undefined -o sol sol.cpp && time ./sol
-
+clang++ -std=c++23 -O2 -Wall -fsanitize=undefined -o main main.cpp && time ./main
