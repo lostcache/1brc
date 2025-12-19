@@ -1,11 +1,13 @@
-rm -f main out.stacks flamegraph.svg
+rm -f main out.perf perf.data perf.data.old flamegraph.svg
 
 clang++ -std=c++23 -O2 -g -fno-omit-frame-pointer -Werror -Wall -o main main.cpp
 
-# Capture stack traces using DTrace (requires sudo)
-sudo dtrace -c './main' \
-    -o out.stacks \
-    -n 'profile-997 /execname == "main"/ { @[ustack(100)] = count(); }'
+# Record stack samples (requires sudo or perf_event_paranoid relaxed)
+sudo perf record -F 997 -g -- ./main
+
+# Convert perf data to folded stacks
+perf script > out.perf
+./stackcollapse-perf.pl out.perf > out.folded
 
 # Generate the flamegraph
-stackcollapse-instruments.pl out.csv | flamegraph.pl > flamegraph.svg
+./flamegraph.pl out.folded > flamegraph.svg
