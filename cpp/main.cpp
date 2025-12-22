@@ -9,12 +9,12 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
-#include <map>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 constexpr char NUM_THREADS = 8;
@@ -38,12 +38,20 @@ int64_t getBatchSize(const std::string& fileName) {
 
 double round1(double value) { return std::round(value * 10.0) / 10.0; }
 
-void printResults(const std::map<std::string, LocationStats>& m) {
+void printResults(const std::unordered_map<std::string, LocationStats>& m) {
+    std::vector<std::string> keys;
+    keys.reserve(1 * 1024 * 1024);
+    for (const auto& it : m) {
+        keys.emplace_back(it.first);
+    }
+    sort(keys.begin(), keys.end());
+
     std::string outBuffer;
-    outBuffer.reserve(8 * 1024 * 1024);
+    outBuffer.reserve(2 * 1024 * 1024);
 
     outBuffer += "{";
-    for (const auto& [location, stat] : m) {
+    for (const auto& location : keys) {
+        auto& stat = m.at(location);
         if (outBuffer.size() > 1) outBuffer += ", ";
 
         outBuffer += location;
@@ -103,7 +111,7 @@ std::optional<std::pair<std::string_view, int32_t>> parseLine(std::string_view l
 }
 
 void updateStats(std::string_view location, int32_t temperature,
-                 std::map<std::string, LocationStats>& m) {
+                 std::unordered_map<std::string, LocationStats>& m) {
     auto& stats = m[std::string(location)];
     stats.min = std::min(stats.min, temperature);
     stats.max = std::max(stats.max, temperature);
@@ -140,7 +148,7 @@ int64_t readTillEndOfLine(int64_t bytesRead, std::string& fileReadBuffer, std::i
     return bytesRead;
 }
 
-void processLines(std::span<const char> buffer, std::map<std::string, LocationStats>& m) {
+void processLines(std::span<const char> buffer, std::unordered_map<std::string, LocationStats>& m) {
     size_t pos = 0;
     size_t validBytes = buffer.size();
 
@@ -167,7 +175,8 @@ void processLines(std::span<const char> buffer, std::map<std::string, LocationSt
 }
 
 void accumulateBatch(int threadIndex, int64_t startPos, int64_t batchBytes,
-                     std::map<std::string, LocationStats>& m, const std::string& fileName) {
+                     std::unordered_map<std::string, LocationStats>& m,
+                     const std::string& fileName) {
     std::ifstream f(fileName, std::ios::binary);
 
     if (!f.is_open()) {
@@ -199,8 +208,9 @@ void accumulateBatch(int threadIndex, int64_t startPos, int64_t batchBytes,
     }
 }
 
-void accumulateThreadResults(const std::vector<std::map<std::string, LocationStats>>& maps,
-                             std::map<std::string, LocationStats>& finalMap) {
+void accumulateThreadResults(
+    const std::vector<std::unordered_map<std::string, LocationStats>>& maps,
+    std::unordered_map<std::string, LocationStats>& finalMap) {
     for (const auto& m : maps) {
         for (const auto& [location, stats] : m) {
             auto& finalStats = finalMap[location];
@@ -213,8 +223,11 @@ void accumulateThreadResults(const std::vector<std::map<std::string, LocationSta
 }
 
 void processInBatches(int64_t batchSize, const std::string& fileName,
-                      std::map<std::string, LocationStats>& finalMap) {
-    std::vector<std::map<std::string, LocationStats>> maps(NUM_THREADS);
+                      std::unordered_map<std::string, LocationStats>& finalMap) {
+    std::vector<std::unordered_map<std::string, LocationStats>> maps(NUM_THREADS);
+    for (auto& m : maps) {
+        m.reserve(2 * 1024 * 1024);
+    }
     std::vector<std::thread> threads;
     threads.reserve(NUM_THREADS);
     for (int i = 0; i < NUM_THREADS; ++i) {
@@ -230,13 +243,14 @@ void processInBatches(int64_t batchSize, const std::string& fileName,
     accumulateThreadResults(maps, finalMap);
 }
 
-void processInSingleBatch(const std::string& fileName,
-                          std::map<std::string, LocationStats>& finalMap) {
+void processInOneBatch(const std::string& fileName,
+                       std::unordered_map<std::string, LocationStats>& finalMap) {
     int64_t fileSize = getFileSize(fileName);
     accumulateBatch(0, 0, fileSize, finalMap, fileName);
 }
 
-void accumulate(const std::string& fileName, std::map<std::string, LocationStats>& finalMap) {
+void accumulate(const std::string& fileName,
+                std::unordered_map<std::string, LocationStats>& finalMap) {
     int64_t batchSize = getBatchSize(fileName);
 
     assert(batchSize > 0);
@@ -244,12 +258,13 @@ void accumulate(const std::string& fileName, std::map<std::string, LocationStats
     if (batchSize > 4 * 1024) {
         processInBatches(batchSize, fileName, finalMap);
     } else {
-        processInSingleBatch(fileName, finalMap);
+        processInOneBatch(fileName, finalMap);
     }
 }
 
 void oneBrc(const char* filename) {
-    std::map<std::string, LocationStats> finalMap;
+    std::unordered_map<std::string, LocationStats> finalMap;
+    finalMap.reserve(2 * 1024 * 1024);
     accumulate(filename, finalMap);
 
     printResults(finalMap);
