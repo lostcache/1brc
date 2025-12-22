@@ -9,7 +9,6 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -72,19 +71,14 @@ void printResults(const std::unordered_map<std::string, LocationStats>& m) {
     std::cout << outBuffer;
 }
 
-std::optional<std::pair<std::string_view, int32_t>> parseLine(std::string_view line) {
+std::pair<std::string_view, int32_t> parseLine(std::string_view line) {
     size_t semicolonPos = line.find(';');
-    if (semicolonPos == std::string_view::npos) {
-        return std::nullopt;
-    }
-
+    assert(semicolonPos != std::string_view::npos);
     std::string_view locationView = line.substr(0, semicolonPos);
 
     // Find start and end of temperature
     size_t tempStart = semicolonPos + 1;
-    if (tempStart >= line.size()) {
-        return std::nullopt;
-    }
+    assert(tempStart < line.size());
 
     // Trim trailing whitespace
     size_t tempEnd = line.size();
@@ -93,18 +87,14 @@ std::optional<std::pair<std::string_view, int32_t>> parseLine(std::string_view l
         --tempEnd;
     }
 
-    if (tempEnd <= tempStart) {
-        return std::nullopt;
-    }
+    assert(tempEnd > tempStart);
 
     double temperature;
     const char* start = line.data() + tempStart;
     const char* end = line.data() + tempEnd;
     auto [ptr, ec] = std::from_chars(start, end, temperature);
 
-    if (ec != std::errc{}) {
-        return std::nullopt;
-    }
+    assert(ptr == end || ec != std::errc{});
 
     int32_t temp_int = static_cast<int32_t>(std::round(temperature * 10));
     return std::make_pair(locationView, temp_int);
@@ -120,7 +110,8 @@ void updateStats(std::string_view location, int32_t temperature,
 }
 
 int64_t skipTillNextLine(int threadIndex, int64_t startPos, std::ifstream& f) {
-    if (startPos == 0) return 0;
+    assert(startPos > 0);
+    assert(threadIndex > 0);
 
     // No need to skip if alredy at start of a new line
     f.seekg(startPos - 1);
@@ -136,10 +127,14 @@ int64_t skipTillNextLine(int threadIndex, int64_t startPos, std::ifstream& f) {
         bytesSkipped++;
     }
     if (f.good()) bytesSkipped++; // skip '\n'
+
+    assert(bytesSkipped > 0);
+
     return bytesSkipped;
 }
 
-int64_t readTillEndOfLine(int64_t bytesRead, std::string& fileReadBuffer, std::ifstream& f) {
+int64_t readTillEndOfLine(std::string& fileReadBuffer, std::ifstream& f) {
+    int64_t bytesRead = f.gcount();
     if (bytesRead > 0 && fileReadBuffer[bytesRead - 1] != '\n') {
         while (f.get(fileReadBuffer[bytesRead]) && fileReadBuffer[bytesRead] != '\n') {
             bytesRead++;
@@ -148,9 +143,12 @@ int64_t readTillEndOfLine(int64_t bytesRead, std::string& fileReadBuffer, std::i
     return bytesRead;
 }
 
-void processLines(std::span<const char> buffer, std::unordered_map<std::string, LocationStats>& m) {
+void processLinesInCurrBatch(std::span<const char> buffer,
+                             std::unordered_map<std::string, LocationStats>& m) {
     size_t pos = 0;
     size_t validBytes = buffer.size();
+
+    assert(validBytes > 0);
 
     while (pos < validBytes) {
         size_t newlinePos = pos;
@@ -158,25 +156,36 @@ void processLines(std::span<const char> buffer, std::unordered_map<std::string, 
             ++newlinePos;
         }
 
-        if (newlinePos > pos) {
-            std::string_view line(buffer.data() + pos, newlinePos - pos);
+        std::string_view line(buffer.data() + pos, newlinePos - pos);
 
-            if (!line.empty()) {
-                auto result = parseLine(line);
-                if (result) {
-                    auto [location, temperature] = *result;
-                    updateStats(location, temperature, m);
-                }
-            }
-        }
+        assert(!line.empty());
+
+        auto result = parseLine(line);
+        auto [location, temperature] = result;
+        updateStats(location, temperature, m);
+        assert(m.size() > 0);
 
         pos = newlinePos + 1;
     }
 }
 
-void accumulateBatch(int threadIndex, int64_t startPos, int64_t batchBytes,
+int64_t readBatch(int64_t batchSizeBytes, int64_t processedBytes, std::string& miniBatchBuffer,
+                  std::ifstream& f) {
+    assert(batchSizeBytes > 0);
+    assert(f.is_open());
+
+    f.read(miniBatchBuffer.data(), std::min(MAX_FILE_READ_BYTES, batchSizeBytes - processedBytes));
+    int64_t bytesRead = readTillEndOfLine(miniBatchBuffer, f);
+    return bytesRead;
+}
+
+void accumulateBatch(int threadIndex, int64_t startPos, int64_t batchSizeBytes,
                      std::unordered_map<std::string, LocationStats>& m,
                      const std::string& fileName) {
+    assert(fileName.size() > 0);
+    assert(startPos >= 0);
+    assert(batchSizeBytes > 0);
+
     std::ifstream f(fileName, std::ios::binary);
 
     if (!f.is_open()) {
@@ -186,25 +195,25 @@ void accumulateBatch(int threadIndex, int64_t startPos, int64_t batchBytes,
 
     // Skip to the next line boundary at the start for non-zero threads
     int64_t processedBytes = 0;
-    if (threadIndex) {
-        processedBytes = skipTillNextLine(threadIndex, startPos, f);
+    if (threadIndex > 0) {
+        processedBytes += skipTillNextLine(threadIndex, startPos, f);
     }
 
+    assert(processedBytes < batchSizeBytes);
+
     // Read mini-batches of size MAX_FILE_READ_BYTES to avoid Out of Memory Error
-    while (processedBytes < batchBytes) {
+    while (processedBytes < batchSizeBytes) {
         std::string miniBatchBuffer;
         // extra 128 bytes to read till next delimiter char even if not part of the batch.
         miniBatchBuffer.resize(MAX_FILE_READ_BYTES + 128);
+        int64_t bytesRead = readBatch(batchSizeBytes, processedBytes, miniBatchBuffer, f);
 
-        f.read(miniBatchBuffer.data(), std::min(MAX_FILE_READ_BYTES, batchBytes - processedBytes));
-        std::streamsize bytesRead = f.gcount();
-        bytesRead = readTillEndOfLine(bytesRead, miniBatchBuffer, f);
-
+        // last batch may have content less than batch size
         if (bytesRead <= 0) break;
 
-        processLines(std::span<const char>(miniBatchBuffer.data(), bytesRead), m);
-
         processedBytes += bytesRead;
+
+        processLinesInCurrBatch(std::span<const char>(miniBatchBuffer.data(), bytesRead), m);
     }
 }
 
@@ -228,6 +237,7 @@ void processInBatches(int64_t batchSize, const std::string& fileName,
     for (auto& m : maps) {
         m.reserve(2 * 1024 * 1024);
     }
+
     std::vector<std::thread> threads;
     threads.reserve(NUM_THREADS);
     for (int i = 0; i < NUM_THREADS; ++i) {
@@ -240,17 +250,24 @@ void processInBatches(int64_t batchSize, const std::string& fileName,
         t.join();
     }
 
+    assert(finalMap.empty());
+
     accumulateThreadResults(maps, finalMap);
 }
 
 void processInOneBatch(const std::string& fileName,
-                          std::unordered_map<std::string, LocationStats>& finalMap) {
+                       std::unordered_map<std::string, LocationStats>& finalMap) {
     int64_t fileSize = getFileSize(fileName);
+
+    assert(fileSize > 0);
+
     accumulateBatch(0, 0, fileSize, finalMap, fileName);
 }
 
 void accumulate(const std::string& fileName,
                 std::unordered_map<std::string, LocationStats>& finalMap) {
+    assert(fileName.size() > 0);
+
     int64_t batchSize = getBatchSize(fileName);
 
     assert(batchSize > 0);
