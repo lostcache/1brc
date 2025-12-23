@@ -170,14 +170,13 @@ int64_t skipTillNextLine(int threadIndex, int64_t startPos, MMAPFile f) {
     return bytesSkipped;
 }
 
-void processLinesInCurrBatch(int64_t startPos, int64_t batchSize, MMAPFile f,
+void processLinesInCurrBatch(int64_t startPos, int64_t batchEnd, MMAPFile f,
                              std::unordered_map<std::string, LocationStats>& m) {
     size_t pos = startPos;
-    size_t batchEnd = startPos + batchSize;
 
     while (pos < batchEnd && pos < f.fileSize) {
         size_t newlinePos = pos;
-        while (pos < batchEnd && pos < f.fileSize && *(f.filePtr + newlinePos) != '\n') {
+        while (newlinePos < f.fileSize && *(f.filePtr + newlinePos) != '\n') {
             ++newlinePos;
         }
 
@@ -199,13 +198,15 @@ void accumulateBatch(int threadIndex, int64_t startPos, int64_t batchSizeBytes,
     assert(startPos >= 0);
     assert(batchSizeBytes > 0);
 
+    int64_t batchEnd = startPos + batchSizeBytes;
+
     // Skip to the next line boundary at the start for non-zero threads
     if (threadIndex > 0) {
         int64_t bytesSkipped = skipTillNextLine(threadIndex, startPos, f);
         startPos += bytesSkipped;
     }
 
-    processLinesInCurrBatch(startPos, batchSizeBytes, f, m);
+    processLinesInCurrBatch(startPos, batchEnd, f, m);
 }
 
 void accumulateThreadResults(
