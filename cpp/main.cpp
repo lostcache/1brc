@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <cassert>
-#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -71,6 +70,23 @@ void printResults(const std::unordered_map<std::string, LocationStats>& m) {
     std::cout << outBuffer;
 }
 
+// Assumes format: [-]D[D].D where D is digit
+int32_t parseInt32(const char* start, const char* end) {
+    bool neg = (*start == '-');
+    if (neg) start++;
+    size_t len = end - start;
+    int32_t num = 0;
+    if (len == 3) {
+        num += (*(start + 0) & 0xF) * 10;
+        num += (*(start + 2) & 0xF) * 1;
+    } else if (len == 4) {
+        num += (*(start + 0) & 0xF) * 100;
+        num += (*(start + 1) & 0xF) * 10;
+        num += (*(start + 3) & 0xF) * 1;
+    }
+    return neg ? -num : num;
+}
+
 std::pair<std::string_view, int32_t> parseLine(std::string_view line) {
     size_t semicolonPos = line.find(';');
     assert(semicolonPos != std::string_view::npos);
@@ -89,14 +105,10 @@ std::pair<std::string_view, int32_t> parseLine(std::string_view line) {
 
     assert(tempEnd > tempStart);
 
-    double temperature;
     const char* start = line.data() + tempStart;
     const char* end = line.data() + tempEnd;
-    auto [ptr, ec] = std::from_chars(start, end, temperature);
+    int32_t temp_int = parseInt32(start, end);
 
-    assert(ptr == end || ec != std::errc{});
-
-    int32_t temp_int = static_cast<int32_t>(std::round(temperature * 10));
     return std::make_pair(locationView, temp_int);
 }
 
