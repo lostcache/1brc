@@ -18,7 +18,7 @@
 #include <unordered_map>
 #include <vector>
 
-constexpr char NUM_THREADS = 4;
+constexpr size_t NUM_THREADS = 4;
 
 struct LocationStats {
     int32_t min = std::numeric_limits<int32_t>::max();
@@ -29,22 +29,20 @@ struct LocationStats {
 
 struct MMAPFile {
     const char* filePtr;
-    const int64_t fileSize;
+    const size_t fileSize;
 };
 
-int64_t getFileSize(const std::string& fileName) {
-    return static_cast<int64_t>(std::filesystem::file_size(fileName));
-}
+size_t getFileSize(const std::string& fileName) { return std::filesystem::file_size(fileName); }
 
 MMAPFile getMmappedFile(const char* fileName) {
-    int32_t fd = open(fileName, O_RDONLY);
+    int fd = open(fileName, O_RDONLY);
 
     if (fd == -1) {
         std::cerr << "Could not read input file" << std::endl;
         std::exit(EXIT_FAILURE);
     }
 
-    int64_t fileSize = getFileSize(fileName);
+    size_t fileSize = getFileSize(fileName);
 
     char* map = static_cast<char*>(mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0));
 
@@ -60,7 +58,7 @@ MMAPFile getMmappedFile(const char* fileName) {
 
 void unMapFile(MMAPFile f) { munmap(const_cast<char*>(f.filePtr), f.fileSize); }
 
-int64_t getBatchSize(int64_t fileSize) { return (fileSize + (NUM_THREADS - 1)) / NUM_THREADS; }
+size_t getBatchSize(size_t fileSize) { return (fileSize + (NUM_THREADS - 1)) / NUM_THREADS; }
 
 double round1(double value) { return std::round(value * 10.0) / 10.0; }
 
@@ -149,7 +147,7 @@ void updateStats(std::string_view location, int32_t temperature,
     stats.sum += temperature;
 }
 
-int64_t skipTillNextLine(int threadIndex, int64_t startPos, MMAPFile f) {
+size_t skipTillNextLine(size_t threadIndex, size_t startPos, MMAPFile f) {
     assert(startPos > 0);
     assert(threadIndex > 0);
 
@@ -158,7 +156,7 @@ int64_t skipTillNextLine(int threadIndex, int64_t startPos, MMAPFile f) {
         return 0;
     }
 
-    int64_t bytesSkipped = 0;
+    size_t bytesSkipped = 0;
     while (*(f.filePtr + startPos + bytesSkipped) != '\n') {
         bytesSkipped++;
     }
@@ -170,7 +168,7 @@ int64_t skipTillNextLine(int threadIndex, int64_t startPos, MMAPFile f) {
     return bytesSkipped;
 }
 
-void processLinesInCurrBatch(int64_t startPos, int64_t batchEnd, MMAPFile f,
+void processLinesInCurrBatch(size_t startPos, size_t batchEnd, MMAPFile f,
                              std::unordered_map<std::string, LocationStats>& m) {
     size_t pos = startPos;
 
@@ -193,16 +191,15 @@ void processLinesInCurrBatch(int64_t startPos, int64_t batchEnd, MMAPFile f,
     }
 }
 
-void accumulateBatch(int threadIndex, int64_t startPos, int64_t batchSizeBytes,
+void accumulateBatch(size_t threadIndex, size_t startPos, size_t batchSizeBytes,
                      std::unordered_map<std::string, LocationStats>& m, MMAPFile f) {
-    assert(startPos >= 0);
     assert(batchSizeBytes > 0);
 
-    int64_t batchEnd = startPos + batchSizeBytes;
+    size_t batchEnd = startPos + batchSizeBytes;
 
     // Skip to the next line boundary at the start for non-zero threads
     if (threadIndex > 0) {
-        int64_t bytesSkipped = skipTillNextLine(threadIndex, startPos, f);
+        size_t bytesSkipped = skipTillNextLine(threadIndex, startPos, f);
         startPos += bytesSkipped;
     }
 
@@ -223,7 +220,7 @@ void accumulateThreadResults(
     }
 }
 
-void processInBatches(MMAPFile f, int64_t batchSize,
+void processInBatches(MMAPFile f, size_t batchSize,
                       std::unordered_map<std::string, LocationStats>& finalMap) {
     std::vector<std::unordered_map<std::string, LocationStats>> maps(NUM_THREADS);
     for (auto& m : maps) {
@@ -232,8 +229,8 @@ void processInBatches(MMAPFile f, int64_t batchSize,
 
     std::vector<std::thread> threads;
     threads.reserve(NUM_THREADS);
-    for (int i = 0; i < NUM_THREADS; ++i) {
-        int64_t startPos = i * batchSize;
+    for (size_t i = 0; i < NUM_THREADS; ++i) {
+        size_t startPos = i * batchSize;
         threads.emplace_back(accumulateBatch, i, startPos, batchSize, std::ref(maps[i]), f);
     }
 
@@ -251,7 +248,7 @@ void processInOneBatch(MMAPFile f, std::unordered_map<std::string, LocationStats
 }
 
 void accumulate(MMAPFile f, std::unordered_map<std::string, LocationStats>& finalMap) {
-    int64_t batchSize = getBatchSize(f.fileSize);
+    size_t batchSize = getBatchSize(f.fileSize);
 
     assert(batchSize > 0);
 
