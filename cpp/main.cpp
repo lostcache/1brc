@@ -22,13 +22,13 @@ constexpr size_t NUM_THREADS = 16;
 
 class FastMap {
   private:
-    std::vector<int32_t> min_vec;
-    std::vector<int32_t> max_vec;
-    std::vector<size_t> freq_vec;
-    std::vector<int64_t> sum_vec;
-    std::vector<std::string> location_vec;
-    size_t capacity;
-    size_t mask;
+    std::vector<int32_t> minVec_;
+    std::vector<int32_t> maxVec_;
+    std::vector<size_t> freqVec_;
+    std::vector<int64_t> sumVec_;
+    std::vector<std::string> locationVec_;
+    size_t capacity_;
+    size_t mask_;
 
     size_t fast_hash(std::string_view sv) {
         size_t hash = 14695981039346656037ULL;
@@ -39,55 +39,55 @@ class FastMap {
         return hash;
     }
 
-    std::string_view getLocation(size_t idx) const { return this->location_vec[idx]; }
+    std::string_view getLocation(size_t idx) const { return this->locationVec_[idx]; }
 
-    int32_t getMin(size_t idx) const { return this->min_vec[idx]; }
+    int32_t getMin(size_t idx) const { return this->minVec_[idx]; }
 
-    int32_t getMax(size_t idx) const { return this->max_vec[idx]; }
+    int32_t getMax(size_t idx) const { return this->maxVec_[idx]; }
 
-    int64_t getSum(size_t idx) const { return this->sum_vec[idx]; }
+    int64_t getSum(size_t idx) const { return this->sumVec_[idx]; }
 
-    size_t getFreq(size_t idx) const { return this->freq_vec[idx]; }
+    size_t getFreq(size_t idx) const { return this->freqVec_[idx]; }
 
     size_t getIdx(std::string_view location) {
         size_t hash = fast_hash(location);
-        size_t idx = hash & mask;
+        size_t idx = hash & mask_;
         while (true) {
-            const auto& locationEntry = this->location_vec[idx];
+            const auto& locationEntry = this->locationVec_[idx];
             if (locationEntry.size() <= 0 || locationEntry == location) {
                 return idx;
             }
-            idx = (idx + 1) & mask;
+            idx = (idx + 1) & mask_;
         }
     }
 
     void updateLocationEntry(size_t idx, std::string_view location) {
-        const auto& locationEntry = this->location_vec[idx];
+        const auto& locationEntry = this->locationVec_[idx];
         if (locationEntry.size() <= 0) {
-            this->location_vec[idx] = std::string(location);
+            this->locationVec_[idx] = std::string(location);
         }
     }
 
     void updateMin(size_t idx, int32_t temperature) {
-        this->min_vec[idx] = std::min(this->min_vec[idx], temperature);
+        this->minVec_[idx] = std::min(this->minVec_[idx], temperature);
     }
 
     void updateMax(size_t idx, int32_t temperature) {
-        this->max_vec[idx] = std::max(this->max_vec[idx], temperature);
+        this->maxVec_[idx] = std::max(this->maxVec_[idx], temperature);
     }
 
-    void updateSum(size_t idx, int64_t value) { this->sum_vec[idx] += value; }
+    void updateSum(size_t idx, int64_t value) { this->sumVec_[idx] += value; }
 
-    void updateFreq(size_t idx) { this->freq_vec[idx]++; }
+    void updateFreq(size_t idx) { this->freqVec_[idx]++; }
 
-    void updateFreq(size_t idx, size_t value) { this->freq_vec[idx] += value; }
+    void updateFreq(size_t idx, size_t value) { this->freqVec_[idx] += value; }
 
     std::vector<size_t> sortKeyIndices() const {
         std::vector<size_t> indices(this->size());
         std::iota(indices.begin(), indices.end(), 0);
 
         std::sort(indices.begin(), indices.end(), [&](const auto& a, const auto& b) {
-            return this->location_vec[a] < this->location_vec[b];
+            return this->locationVec_[a] < this->locationVec_[b];
         });
 
         return indices;
@@ -96,15 +96,15 @@ class FastMap {
     double roundTowardsINF(double value) const { return std::round(value * 10.0) / 10.0; }
 
   public:
-    FastMap(size_t initCap = 1 << 14) : capacity(initCap), mask(initCap - 1) {
-        min_vec.resize(initCap, std::numeric_limits<int32_t>::max());
-        max_vec.resize(initCap, std::numeric_limits<int32_t>::min());
-        freq_vec.resize(initCap, 0);
-        sum_vec.resize(initCap, 0);
-        location_vec.resize(initCap, "");
+    FastMap(size_t initCap = 1 << 14) : capacity_(initCap), mask_(initCap - 1) {
+        minVec_.resize(initCap, std::numeric_limits<int32_t>::max());
+        maxVec_.resize(initCap, std::numeric_limits<int32_t>::min());
+        freqVec_.resize(initCap, 0);
+        sumVec_.resize(initCap, 0);
+        locationVec_.resize(initCap);
     }
 
-    size_t size() const { return this->capacity; }
+    size_t size() const { return this->capacity_; }
 
     void updateRunning(std::string_view location, int32_t temperature) {
         size_t idx = this->getIdx(location);
