@@ -19,6 +19,7 @@
 #include <vector>
 
 constexpr size_t NUM_THREADS = 16;
+constexpr size_t MAX_CITIES = 10000;
 
 struct LocationStats {
     int32_t min = std::numeric_limits<int32_t>::max();
@@ -64,7 +65,7 @@ double round1(double value) { return std::round(value * 10.0) / 10.0; }
 
 void printResults(const std::unordered_map<std::string, LocationStats>& m) {
     std::vector<std::string> keys;
-    keys.reserve(1 * 1024 * 1024);
+    keys.reserve(MAX_CITIES);
     for (const auto& it : m) {
         keys.emplace_back(it.first);
     }
@@ -224,7 +225,7 @@ void processInBatches(MMAPFile f, size_t batchSize,
                       std::unordered_map<std::string, LocationStats>& finalMap) {
     std::vector<std::unordered_map<std::string, LocationStats>> maps(NUM_THREADS);
     for (auto& m : maps) {
-        m.reserve(2 * 1024 * 1024);
+        m.reserve(MAX_CITIES);
     }
 
     std::vector<std::thread> threads;
@@ -263,7 +264,7 @@ void oneBrc(const char* filename) {
     MMAPFile f = getMmappedFile(filename);
 
     std::unordered_map<std::string, LocationStats> finalMap;
-    finalMap.reserve(2 * 1024 * 1024);
+    finalMap.reserve(MAX_CITIES);
 
     accumulate(f, finalMap);
 
