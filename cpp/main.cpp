@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <string_view>
 #include <sys/fcntl.h>
@@ -15,17 +16,149 @@
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
-#include <unordered_map>
 #include <vector>
 
 constexpr size_t NUM_THREADS = 16;
-constexpr size_t MAX_CITIES = 10000;
 
-struct LocationStats {
-    int32_t min = std::numeric_limits<int32_t>::max();
-    int32_t max = std::numeric_limits<int32_t>::min();
-    int64_t sum = 0;
-    int32_t freq = 0;
+class FastMap {
+  private:
+    std::vector<int32_t> min_vec;
+    std::vector<int32_t> max_vec;
+    std::vector<size_t> freq_vec;
+    std::vector<int64_t> sum_vec;
+    std::vector<std::string> location_vec;
+    size_t capacity;
+    size_t mask;
+
+    size_t fast_hash(std::string_view sv) {
+        size_t hash = 14695981039346656037ULL;
+        for (char c : sv) {
+            hash ^= static_cast<size_t>(c);
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
+
+    std::string_view getLocation(size_t idx) const { return this->location_vec[idx]; }
+
+    int32_t getMin(size_t idx) const { return this->min_vec[idx]; }
+
+    int32_t getMax(size_t idx) const { return this->max_vec[idx]; }
+
+    int64_t getSum(size_t idx) const { return this->sum_vec[idx]; }
+
+    size_t getFreq(size_t idx) const { return this->freq_vec[idx]; }
+
+    size_t getIdx(std::string_view location) {
+        size_t hash = fast_hash(location);
+        size_t idx = hash & mask;
+        while (true) {
+            const auto& locationEntry = this->location_vec[idx];
+            if (locationEntry.size() <= 0 || locationEntry == location) {
+                return idx;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    void updateLocationEntry(size_t idx, std::string_view location) {
+        const auto& locationEntry = this->location_vec[idx];
+        if (locationEntry.size() <= 0) {
+            this->location_vec[idx] = std::string(location);
+        }
+    }
+
+    void updateMin(size_t idx, int32_t temperature) {
+        this->min_vec[idx] = std::min(this->min_vec[idx], temperature);
+    }
+
+    void updateMax(size_t idx, int32_t temperature) {
+        this->max_vec[idx] = std::max(this->max_vec[idx], temperature);
+    }
+
+    void updateSum(size_t idx, int64_t value) { this->sum_vec[idx] += value; }
+
+    void updateFreq(size_t idx) { this->freq_vec[idx]++; }
+
+    void updateFreq(size_t idx, size_t value) { this->freq_vec[idx] += value; }
+
+    std::vector<size_t> sortKeyIndices() const {
+        std::vector<size_t> indices(this->size());
+        std::iota(indices.begin(), indices.end(), 0);
+
+        std::sort(indices.begin(), indices.end(), [&](const auto& a, const auto& b) {
+            return this->location_vec[a] < this->location_vec[b];
+        });
+
+        return indices;
+    }
+
+    double roundTowardsINF(double value) const { return std::round(value * 10.0) / 10.0; }
+
+  public:
+    FastMap(size_t initCap = 1 << 14) : capacity(initCap), mask(initCap - 1) {
+        min_vec.resize(initCap, std::numeric_limits<int32_t>::max());
+        max_vec.resize(initCap, std::numeric_limits<int32_t>::min());
+        freq_vec.resize(initCap, 0);
+        sum_vec.resize(initCap, 0);
+        location_vec.resize(initCap, "");
+    }
+
+    size_t size() const { return this->capacity; }
+
+    void updateRunning(std::string_view location, int32_t temperature) {
+        size_t idx = this->getIdx(location);
+        this->updateLocationEntry(idx, location);
+        this->updateMin(idx, temperature);
+        this->updateMax(idx, temperature);
+        this->updateFreq(idx);
+        this->updateSum(idx, temperature);
+    }
+
+    void updateBatch(const FastMap& other) {
+        for (size_t otherIdx = 0; otherIdx < other.size(); ++otherIdx) {
+            const auto& otherLocation = other.getLocation(otherIdx);
+            if (otherLocation.size() <= 0) continue;
+            size_t thisIdx = this->getIdx(otherLocation);
+
+            this->updateLocationEntry(thisIdx, otherLocation);
+            this->updateMin(thisIdx, other.getMin(otherIdx));
+            this->updateMax(thisIdx, other.getMax(otherIdx));
+            this->updateFreq(thisIdx, other.getFreq(otherIdx));
+            this->updateSum(thisIdx, other.getSum(otherIdx));
+        }
+    }
+
+    void printSorted() const {
+        std::vector<size_t> sortedKeyIndices = this->sortKeyIndices();
+
+        std::string outBuffer;
+        outBuffer.reserve(2 * 1024 * 1024);
+
+        for (auto idx : sortedKeyIndices) {
+            if (outBuffer.size() > 1) outBuffer += ", ";
+
+            const auto& location = this->getLocation(idx);
+
+            if (location.size() <= 0) continue;
+
+            outBuffer += location;
+            outBuffer += "=";
+
+            double min_val = this->getMin(idx) / 10.0;
+            double max_val = this->getMax(idx) / 10.0;
+            double avg =
+                roundTowardsINF(this->getSum(idx) / static_cast<double>(this->getFreq(idx) * 10));
+
+            size_t pos = outBuffer.size();
+            outBuffer.resize(pos + 32);
+            int writtenBytes =
+                std::snprintf(&outBuffer[pos], 32, "%.1f/%.1f/%.1f", min_val, avg, max_val);
+            outBuffer.resize(pos + writtenBytes);
+        }
+
+        std::cout << outBuffer;
+    }
 };
 
 struct MMAPFile {
@@ -60,42 +193,6 @@ MMAPFile getMmappedFile(const char* fileName) {
 void unMapFile(MMAPFile f) { munmap(const_cast<char*>(f.filePtr), f.fileSize); }
 
 size_t getBatchSize(size_t fileSize) { return (fileSize + (NUM_THREADS - 1)) / NUM_THREADS; }
-
-double round1(double value) { return std::round(value * 10.0) / 10.0; }
-
-void printResults(const std::unordered_map<std::string, LocationStats>& m) {
-    std::vector<std::string> keys;
-    keys.reserve(MAX_CITIES);
-    for (const auto& it : m) {
-        keys.emplace_back(it.first);
-    }
-    sort(keys.begin(), keys.end());
-
-    std::string outBuffer;
-    outBuffer.reserve(2 * 1024 * 1024);
-
-    outBuffer += "{";
-    for (const auto& location : keys) {
-        auto& stat = m.at(location);
-        if (outBuffer.size() > 1) outBuffer += ", ";
-
-        outBuffer += location;
-        outBuffer += "=";
-
-        double min_val = stat.min / 10.0;
-        double max_val = stat.max / 10.0;
-        double avg = round1(stat.sum / static_cast<double>(stat.freq * 10));
-
-        size_t pos = outBuffer.size();
-        outBuffer.resize(pos + 32);
-        int writtenBytes =
-            std::snprintf(&outBuffer[pos], 32, "%.1f/%.1f/%.1f", min_val, avg, max_val);
-        outBuffer.resize(pos + writtenBytes);
-    }
-    outBuffer += "}\n";
-
-    std::cout << outBuffer;
-}
 
 // Assumes format: [-]D[D].D where D is digit
 int32_t parseInt32(const char* start, const char* end) {
@@ -139,15 +236,6 @@ std::pair<std::string_view, int32_t> parseLine(std::string_view line) {
     return std::make_pair(locationView, temp_int);
 }
 
-void updateStats(std::string_view location, int32_t temperature,
-                 std::unordered_map<std::string, LocationStats>& m) {
-    auto& stats = m[std::string(location)];
-    stats.min = std::min(stats.min, temperature);
-    stats.max = std::max(stats.max, temperature);
-    stats.freq++;
-    stats.sum += temperature;
-}
-
 size_t skipTillNextLine(size_t threadIndex, size_t startPos, MMAPFile f) {
     assert(startPos > 0);
     assert(threadIndex > 0);
@@ -169,8 +257,7 @@ size_t skipTillNextLine(size_t threadIndex, size_t startPos, MMAPFile f) {
     return bytesSkipped;
 }
 
-void processLinesInCurrBatch(size_t startPos, size_t batchEnd, MMAPFile f,
-                             std::unordered_map<std::string, LocationStats>& m) {
+void processLinesInCurrBatch(size_t startPos, size_t batchEnd, MMAPFile f, FastMap& m) {
     size_t pos = startPos;
 
     while (pos < batchEnd && pos < f.fileSize) {
@@ -185,15 +272,15 @@ void processLinesInCurrBatch(size_t startPos, size_t batchEnd, MMAPFile f,
 
         auto result = parseLine(line);
         auto [location, temperature] = result;
-        updateStats(location, temperature, m);
+        m.updateRunning(location, temperature);
         assert(m.size() > 0);
 
         pos = newlinePos + 1;
     }
 }
 
-void accumulateBatch(size_t threadIndex, size_t startPos, size_t batchSizeBytes,
-                     std::unordered_map<std::string, LocationStats>& m, MMAPFile f) {
+void accumulateBatch(size_t threadIndex, size_t startPos, size_t batchSizeBytes, FastMap& m,
+                     MMAPFile f) {
     assert(batchSizeBytes > 0);
 
     size_t batchEnd = startPos + batchSizeBytes;
@@ -207,26 +294,14 @@ void accumulateBatch(size_t threadIndex, size_t startPos, size_t batchSizeBytes,
     processLinesInCurrBatch(startPos, batchEnd, f, m);
 }
 
-void accumulateThreadResults(
-    const std::vector<std::unordered_map<std::string, LocationStats>>& maps,
-    std::unordered_map<std::string, LocationStats>& finalMap) {
+void accumulateThreadResults(const std::vector<FastMap>& maps, FastMap& finalMap) {
     for (const auto& m : maps) {
-        for (const auto& [location, stats] : m) {
-            auto& finalStats = finalMap[location];
-            finalStats.freq += stats.freq;
-            finalStats.sum += stats.sum;
-            finalStats.max = std::max(finalStats.max, stats.max);
-            finalStats.min = std::min(finalStats.min, stats.min);
-        }
+        finalMap.updateBatch(m);
     }
 }
 
-void processInBatches(MMAPFile f, size_t batchSize,
-                      std::unordered_map<std::string, LocationStats>& finalMap) {
-    std::vector<std::unordered_map<std::string, LocationStats>> maps(NUM_THREADS);
-    for (auto& m : maps) {
-        m.reserve(MAX_CITIES);
-    }
+void processInBatches(MMAPFile f, size_t batchSize, FastMap& finalMap) {
+    std::vector<FastMap> maps(NUM_THREADS, FastMap());
 
     std::vector<std::thread> threads;
     threads.reserve(NUM_THREADS);
@@ -239,16 +314,14 @@ void processInBatches(MMAPFile f, size_t batchSize,
         t.join();
     }
 
-    assert(finalMap.empty());
-
     accumulateThreadResults(maps, finalMap);
 }
 
-void processInOneBatch(MMAPFile f, std::unordered_map<std::string, LocationStats>& finalMap) {
+void processInOneBatch(MMAPFile f, FastMap& finalMap) {
     accumulateBatch(0, 0, f.fileSize, finalMap, f);
 }
 
-void accumulate(MMAPFile f, std::unordered_map<std::string, LocationStats>& finalMap) {
+void accumulate(MMAPFile f, FastMap& finalMap) {
     size_t batchSize = getBatchSize(f.fileSize);
 
     assert(batchSize > 0);
@@ -263,12 +336,12 @@ void accumulate(MMAPFile f, std::unordered_map<std::string, LocationStats>& fina
 void oneBrc(const char* filename) {
     MMAPFile f = getMmappedFile(filename);
 
-    std::unordered_map<std::string, LocationStats> finalMap;
-    finalMap.reserve(MAX_CITIES);
-
+    FastMap finalMap;
     accumulate(f, finalMap);
 
-    printResults(finalMap);
+    std::cout << '{';
+    finalMap.printSorted();
+    std::cout << "}\n";
 
     unMapFile(f);
 }
