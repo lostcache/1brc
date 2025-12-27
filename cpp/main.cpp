@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <emmintrin.h>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -18,7 +20,42 @@
 #include <unistd.h>
 #include <vector>
 
-constexpr size_t NUM_THREADS = 16;
+static constexpr size_t NUM_THREADS = 8;
+
+const char* simd_find_char(const char* start, const char* end, const char delimiter) {
+    static constexpr size_t stride = 16;
+
+    // Create a SIMD register filled with the newline character
+    __m128i newline_mask = _mm_set1_epi8(delimiter);
+
+    for (; start + (stride - 1) < end; start += stride) {
+        // Load 16 bytes of data from memory
+        __m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(start));
+
+        // Result: 0xFF in a byte if match, 0x00 otherwise
+        __m128i comparison_result = _mm_cmpeq_epi8(data, newline_mask);
+
+        // Convert the SIMD mask to an integer bitmask
+        int mask = _mm_movemask_epi8(comparison_result);
+
+        // Check if any bit is set (i.e., a newline was found)
+        if (mask != 0) {
+            // Find the index of the first set bit (first newline)
+            int index = __builtin_ctz(mask); // count trailing zeros intrinsic
+            return start + index;
+        }
+    }
+
+    // Fallback for remaining characters or if no newline found in main loop
+    for (; start < end; ++start) {
+        if (*start == delimiter) {
+            return start;
+        }
+    }
+
+    // not found
+    return nullptr;
+}
 
 class FastMap {
   private:
@@ -211,46 +248,32 @@ int32_t parseInt32(const char* start, const char* end) {
     return neg ? -num : num;
 }
 
-std::pair<std::string_view, int32_t> parseLine(std::string_view line) {
-    size_t semicolonPos = line.find(';');
-    assert(semicolonPos != std::string_view::npos);
-    std::string_view locationView = line.substr(0, semicolonPos);
+std::pair<std::string_view, int32_t> parseLine(const char* lineStartPtr, const char* lineEndPtr) {
+    const char* semiColPtr = simd_find_char(lineStartPtr, lineEndPtr, ';');
+    assert(semiColPtr != nullptr);
 
-    // Find start and end of temperature
-    size_t tempStart = semicolonPos + 1;
-    assert(tempStart < line.size());
+    size_t semicolonPos = semiColPtr - lineStartPtr;
 
-    // Trim trailing whitespace
-    size_t tempEnd = line.size();
-    while (tempEnd > tempStart && (line[tempEnd - 1] == ' ' || line[tempEnd - 1] == '\t' ||
-                                   line[tempEnd - 1] == '\n' || line[tempEnd - 1] == '\r')) {
-        --tempEnd;
-    }
+    int32_t temp_int = parseInt32(semiColPtr + 1, lineEndPtr);
 
-    assert(tempEnd > tempStart);
-
-    const char* start = line.data() + tempStart;
-    const char* end = line.data() + tempEnd;
-    int32_t temp_int = parseInt32(start, end);
-
-    return std::make_pair(locationView, temp_int);
+    return std::make_pair(std::string_view(lineStartPtr, semicolonPos), temp_int);
 }
 
-size_t skipTillNextLine(size_t threadIndex, size_t startPos, MMAPFile f) {
+size_t skipTillNextLine(size_t startPos, size_t batchEnd, MMAPFile f) {
     assert(startPos > 0);
-    assert(threadIndex > 0);
 
     const char* prevChar = f.filePtr + startPos - 1;
     if (*prevChar == '\n') {
         return 0;
     }
 
-    size_t bytesSkipped = 0;
-    while (*(f.filePtr + startPos + bytesSkipped) != '\n') {
-        bytesSkipped++;
-    }
+    const char* startPtr = f.filePtr + startPos;
+    const char* endPtr = f.filePtr + batchEnd;
+    const char* newLinePtr = simd_find_char(startPtr, endPtr, '\n');
 
-    bytesSkipped++; // skip '\n'
+    assert(newLinePtr != nullptr);
+
+    size_t bytesSkipped = newLinePtr - startPtr + 1;
 
     assert(bytesSkipped > 0);
 
@@ -260,22 +283,24 @@ size_t skipTillNextLine(size_t threadIndex, size_t startPos, MMAPFile f) {
 void processLinesInCurrBatch(size_t startPos, size_t batchEnd, MMAPFile f, FastMap& m) {
     size_t pos = startPos;
 
-    while (pos < batchEnd && pos < f.fileSize) {
-        size_t newlinePos = pos;
-        while (newlinePos < f.fileSize && *(f.filePtr + newlinePos) != '\n') {
-            ++newlinePos;
+    while (pos < batchEnd) {
+        const char* lineStartPtr = f.filePtr + pos;
+        const char* searchEndPtr = f.filePtr + f.fileSize;
+        const char* newLinePtr = simd_find_char(lineStartPtr, searchEndPtr, '\n');
+
+        // If no newline found, we've reached the end (The last entry is not followed by '\n' char)
+        if (newLinePtr == nullptr) {
+            break;
         }
 
-        std::string_view line(f.filePtr + pos, newlinePos - pos);
+        const char* lineEndPtr = newLinePtr;
 
-        assert(!line.empty());
-
-        auto result = parseLine(line);
+        auto result = parseLine(lineStartPtr, lineEndPtr);
         auto [location, temperature] = result;
         m.updateRunning(location, temperature);
         assert(m.size() > 0);
 
-        pos = newlinePos + 1;
+        pos = (newLinePtr - f.filePtr) + 1;
     }
 }
 
@@ -287,7 +312,7 @@ void accumulateBatch(size_t threadIndex, size_t startPos, size_t batchSizeBytes,
 
     // Skip to the next line boundary at the start for non-zero threads
     if (threadIndex > 0) {
-        size_t bytesSkipped = skipTillNextLine(threadIndex, startPos, f);
+        size_t bytesSkipped = skipTillNextLine(startPos, batchEnd, f);
         startPos += bytesSkipped;
     }
 
