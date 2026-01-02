@@ -1,4 +1,4 @@
-// ~98s
+// ~95.536s
 
 use std::{
     io::{BufRead, Read, Seek},
@@ -47,22 +47,26 @@ fn print_result(
     Ok(())
 }
 
-fn parse_line(line: &[u8]) -> Option<(String, i32)> {
-    let semicolon_pos = line.iter().position(|&b| b == b';')?;
-    let location = &line[..semicolon_pos];
-    let temp_bytes = &line[semicolon_pos + 1..];
+fn parse_line(line: &str) -> Option<(String, i32)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
 
-    if location.is_empty() || temp_bytes.is_empty() {
+    let semicolon_pos = line.find(';')?;
+    let location = &line[..semicolon_pos];
+    let temp_str = &line[semicolon_pos + 1..];
+
+    if location.is_empty() || temp_str.is_empty() {
         return None;
     }
 
     // Parse temperature from bytes
-    let temp_str = std::str::from_utf8(temp_bytes).ok()?.trim();
     let temperature: f64 = temp_str.parse().ok()?;
     let temp_int = (temperature * 10.0).round() as i32;
 
     // Convert location bytes to String
-    let location_str = std::str::from_utf8(location).ok()?.to_string();
+    let location_str = location.to_string();
 
     Some((location_str, temp_int))
 }
@@ -103,28 +107,21 @@ fn update_stats(
     entry.freq += 1;
 }
 
-fn skip_first_line(start: u64, f: &mut std::fs::File) -> u64 {
+fn skip_first_line(start: u64, fp: &std::path::Path) -> u64 {
     assert!(start > 0);
 
     let mut skipped_bytes = 0u64;
+
+    let mut f = std::fs::File::open(fp).unwrap();
+
     f.seek(std::io::SeekFrom::Start(start - 1)).unwrap();
     let mut prev_char = [0u8; 1];
     f.read_exact(&mut prev_char).unwrap();
 
     if prev_char[0] != b'\n' {
-        // Skip rest of partial line and count the bytes
-        loop {
-            let mut byte = [0u8; 1];
-            match f.read_exact(&mut byte) {
-                Ok(()) => {
-                    skipped_bytes += 1;
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        let mut buf_reader = std::io::BufReader::new(f);
+        let mut buf = std::string::String::with_capacity(128);
+        skipped_bytes += buf_reader.read_line(&mut buf).unwrap() as u64;
     }
 
     skipped_bytes
@@ -136,8 +133,6 @@ fn process_batch(
     start: u64,
     batch_bytes: u64,
 ) -> std::collections::BTreeMap<String, LocationStats> {
-    let mut m = std::collections::BTreeMap::<String, LocationStats>::new();
-
     let mut f = std::fs::File::open(file_path).unwrap();
 
     let mut processed_bytes = 0u64;
@@ -145,63 +140,30 @@ fn process_batch(
     if thread_idx == 0 {
         f.seek(std::io::SeekFrom::Start(start)).unwrap();
     } else {
-        processed_bytes += skip_first_line(start, &mut f);
+        processed_bytes += skip_first_line(start, file_path);
+        f.seek(std::io::SeekFrom::Start(start + processed_bytes))
+            .unwrap();
     }
 
     let mut buf_reader = std::io::BufReader::new(f);
+    let mut m = std::collections::BTreeMap::<String, LocationStats>::new();
+    let mut line = std::string::String::with_capacity(128);
 
     loop {
         if processed_bytes >= batch_bytes {
             break;
         }
 
-        let buf = match buf_reader.fill_buf() {
-            Ok(buf) if buf.is_empty() => break, // EOF
-            Ok(buf) => buf,
-            Err(_) => break,
-        };
+        line.clear();
+        let bytes_read = buf_reader.read_line(&mut line).unwrap() as u64;
+        if bytes_read == 0 {
+            break; // EOF
+        }
 
-        let line_end = buf.iter().position(|&b| b == b'\n');
+        processed_bytes += bytes_read;
 
-        match line_end {
-            Some(pos) => {
-                let line = &buf[..pos];
-                if !line.is_empty() {
-                    if let Some((location, temperature)) = parse_line(line) {
-                        update_stats(&mut m, location, temperature);
-                    }
-                }
-                let bytes_consumed = pos + 1;
-                buf_reader.consume(bytes_consumed);
-                processed_bytes += bytes_consumed as u64;
-            }
-            // No newline
-            //      case 1: when internal buffer ends with a line split
-            //      case 2: EOF
-            // just call read_until directly, it'll handle the buffer internally
-            None => {
-                let mut line_buf = Vec::new();
-
-                match buf_reader.read_until(b'\n', &mut line_buf) {
-                    Ok(0) | Ok(_) if line_buf.is_empty() => break,
-                    Ok(n) => {
-                        let line = if line_buf.ends_with(&[b'\n']) {
-                            &line_buf[..line_buf.len() - 1]
-                        } else {
-                            &line_buf[..]
-                        };
-
-                        if !line.is_empty() {
-                            if let Some((location, temperature)) = parse_line(line) {
-                                update_stats(&mut m, location, temperature);
-                            }
-                        }
-
-                        processed_bytes += n as u64;
-                    }
-                    Err(_) => break,
-                }
-            }
+        if let Some((location, temperature)) = parse_line(&line) {
+            update_stats(&mut m, location, temperature);
         }
     }
 
