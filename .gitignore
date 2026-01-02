@@ -10,3 +10,6 @@ perf.data
 
 # executables
 main
+target
+data
+
