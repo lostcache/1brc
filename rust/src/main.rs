@@ -1,10 +1,4 @@
 // ~95.536s
-
-use std::{
-    io::{BufRead, Read, Seek},
-    thread::JoinHandle,
-};
-
 const NUM_THREADS: usize = 8;
 
 struct LocationStats {
@@ -47,30 +41,6 @@ fn print_result(
     Ok(())
 }
 
-fn parse_line(line: &str) -> Option<(String, i32)> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
-    }
-
-    let semicolon_pos = line.find(';')?;
-    let location = &line[..semicolon_pos];
-    let temp_str = &line[semicolon_pos + 1..];
-
-    if location.is_empty() || temp_str.is_empty() {
-        return None;
-    }
-
-    // Parse temperature from bytes
-    let temperature: f64 = temp_str.parse().ok()?;
-    let temp_int = (temperature * 10.0).round() as i32;
-
-    // Convert location bytes to String
-    let location_str = location.to_string();
-
-    Some((location_str, temp_int))
-}
-
 fn update_map(
     main_map: &mut std::collections::BTreeMap<String, LocationStats>,
     batch_map: std::collections::BTreeMap<String, LocationStats>,
@@ -107,64 +77,96 @@ fn update_stats(
     entry.freq += 1;
 }
 
-fn skip_first_line(start: u64, fp: &std::path::Path) -> u64 {
+fn skip_first_line(start: u64, mmap_f: &[u8]) -> u64 {
     assert!(start > 0);
 
-    let mut skipped_bytes = 0u64;
+    let prev_char = mmap_f[(start - 1) as usize];
 
-    let mut f = std::fs::File::open(fp).unwrap();
-
-    f.seek(std::io::SeekFrom::Start(start - 1)).unwrap();
-    let mut prev_char = [0u8; 1];
-    f.read_exact(&mut prev_char).unwrap();
-
-    if prev_char[0] != b'\n' {
-        let mut buf_reader = std::io::BufReader::new(f);
-        let mut buf = std::string::String::with_capacity(128);
-        skipped_bytes += buf_reader.read_line(&mut buf).unwrap() as u64;
+    if prev_char == b'\n' {
+        return 0;
     }
 
-    skipped_bytes
+    let mut new_line_char_pos = start as usize;
+    loop {
+        if new_line_char_pos >= mmap_f.len() || mmap_f[new_line_char_pos] == b'\n' {
+            break;
+        }
+        new_line_char_pos += 1;
+    }
+
+    new_line_char_pos as u64 - start + 1
+}
+
+fn parse_line(line: &[u8]) -> Option<(String, i32)> {
+    if line.is_empty() {
+        return None;
+    }
+
+    let mut semicol_pos = 0 as usize;
+    loop {
+        if line[semicol_pos] == b';' {
+            break;
+        }
+        semicol_pos += 1;
+    }
+
+    let location = &line[..semicol_pos];
+    let temp_str = &line[semicol_pos + 1..];
+
+    if location.is_empty() || temp_str.is_empty() {
+        return None;
+    }
+
+    // Parse temperature from bytes
+    let temperature: f64 = std::str::from_utf8(temp_str).unwrap().parse().unwrap();
+    let temp_int = (temperature * 10.0).round() as i32;
+
+    // Convert location bytes to String
+    let location_str = std::str::from_utf8(location).unwrap().to_string();
+
+    Some((location_str, temp_int))
 }
 
 fn process_batch(
     thread_idx: usize,
-    file_path: &std::path::Path,
+    mmap_f: &[u8],
     start: u64,
     batch_bytes: u64,
 ) -> std::collections::BTreeMap<String, LocationStats> {
-    let mut f = std::fs::File::open(file_path).unwrap();
+    let mut processed_bytes = 0 as u64;
 
-    let mut processed_bytes = 0u64;
-
-    if thread_idx == 0 {
-        f.seek(std::io::SeekFrom::Start(start)).unwrap();
-    } else {
-        processed_bytes += skip_first_line(start, file_path);
-        f.seek(std::io::SeekFrom::Start(start + processed_bytes))
-            .unwrap();
+    if thread_idx != 0 {
+        processed_bytes += skip_first_line(start, mmap_f);
     }
 
-    let mut buf_reader = std::io::BufReader::new(f);
     let mut m = std::collections::BTreeMap::<String, LocationStats>::new();
-    let mut line = std::string::String::with_capacity(128);
 
     loop {
         if processed_bytes >= batch_bytes {
             break;
         }
 
-        line.clear();
-        let bytes_read = buf_reader.read_line(&mut line).unwrap() as u64;
-        if bytes_read == 0 {
-            break; // EOF
+        let line_start = (start + processed_bytes) as usize;
+        if line_start >= mmap_f.len() {
+            break;
         }
 
-        processed_bytes += bytes_read;
+        let mut new_line_char_pos = start + processed_bytes;
+        loop {
+            if new_line_char_pos as usize >= mmap_f.len()
+                || mmap_f[new_line_char_pos as usize] == b'\n'
+            {
+                break;
+            }
+            new_line_char_pos += 1;
+        }
 
-        if let Some((location, temperature)) = parse_line(&line) {
+        let line_end = new_line_char_pos as usize;
+        if let Some((location, temperature)) = parse_line(&mmap_f[line_start..line_end]) {
             update_stats(&mut m, location, temperature);
         }
+
+        processed_bytes += (line_end - line_start + 1) as u64;
     }
 
     m
@@ -174,16 +176,22 @@ fn process_in_batches(
     file_path: &std::path::Path,
     file_size: u64,
 ) -> std::collections::BTreeMap<String, LocationStats> {
+    // Create mmap once and share it across all threads
+    let f = std::fs::File::open(file_path).unwrap();
+    let mmap_f = unsafe { memmap2::Mmap::map(&f).unwrap() };
+    let mmap_arc = std::sync::Arc::new(mmap_f);
+
     let batch_size = (file_size + NUM_THREADS as u64 - 1) / NUM_THREADS as u64;
-    let mut handles: std::vec::Vec<JoinHandle<std::collections::BTreeMap<String, LocationStats>>> =
-        Vec::with_capacity(NUM_THREADS);
+    let mut handles: std::vec::Vec<
+        std::thread::JoinHandle<std::collections::BTreeMap<String, LocationStats>>,
+    > = Vec::with_capacity(NUM_THREADS);
 
     for i in 0..NUM_THREADS {
         let start = i as u64 * batch_size;
-        let path = file_path.to_path_buf();
+        let mmap_clone = mmap_arc.clone();
 
         handles.push(std::thread::spawn(move || {
-            process_batch(i, &path, start, batch_size)
+            process_batch(i, &mmap_clone, start, batch_size)
         }));
     }
 
@@ -200,7 +208,9 @@ fn process_in_single_batch(
     file_path: &std::path::Path,
     file_size: u64,
 ) -> std::collections::BTreeMap<String, LocationStats> {
-    process_batch(0, file_path, 0, file_size)
+    let f = std::fs::File::open(file_path).unwrap();
+    let mmap_f = unsafe { memmap2::Mmap::map(&f).unwrap() };
+    process_batch(0, &mmap_f, 0, file_size)
 }
 
 fn process(file_path: &std::path::Path) -> std::collections::BTreeMap<String, LocationStats> {
