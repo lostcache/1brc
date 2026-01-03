@@ -1,6 +1,7 @@
-// ~95.536s
+// ~52.236s
 const NUM_THREADS: usize = 8;
 
+#[derive(Clone)]
 struct LocationStats {
     min: i32,
     max: i32,
@@ -17,10 +18,14 @@ fn get_file_path() -> std::path::PathBuf {
 }
 
 fn print_result(
-    m: &std::collections::BTreeMap<String, LocationStats>,
+    m: &std::collections::HashMap<String, LocationStats>,
 ) -> Result<(), std::io::Error> {
+    let mut tree_m = std::collections::BTreeMap::<String, LocationStats>::new();
+    for (location, location_stat) in m {
+        tree_m.insert(location.to_string(), location_stat.clone());
+    }
     print!("{{");
-    let mut it = m.iter().peekable();
+    let mut it = tree_m.iter().peekable();
     while let Some((location, stat)) = it.next() {
         let mut avg = stat.sum as f64 / stat.freq as f64 / 10.0;
         avg = (avg * 10.0).round() / 10.0;
@@ -42,8 +47,8 @@ fn print_result(
 }
 
 fn update_map(
-    main_map: &mut std::collections::BTreeMap<String, LocationStats>,
-    batch_map: std::collections::BTreeMap<String, LocationStats>,
+    main_map: &mut std::collections::HashMap<String, LocationStats>,
+    batch_map: std::collections::HashMap<String, LocationStats>,
 ) {
     for (location, stats) in batch_map {
         let entry = main_map.entry(location).or_insert(LocationStats {
@@ -61,7 +66,7 @@ fn update_map(
 }
 
 fn update_stats(
-    m: &mut std::collections::BTreeMap<String, LocationStats>,
+    m: &mut std::collections::HashMap<String, LocationStats>,
     location: String,
     temperature: i32,
 ) {
@@ -132,14 +137,14 @@ fn process_batch(
     mmap_f: &[u8],
     start: u64,
     batch_bytes: u64,
-) -> std::collections::BTreeMap<String, LocationStats> {
+) -> std::collections::HashMap<String, LocationStats> {
     let mut processed_bytes = 0 as u64;
 
     if thread_idx != 0 {
         processed_bytes += skip_first_line(start, mmap_f);
     }
 
-    let mut m = std::collections::BTreeMap::<String, LocationStats>::new();
+    let mut m = std::collections::HashMap::<String, LocationStats>::new();
 
     loop {
         if processed_bytes >= batch_bytes {
@@ -175,7 +180,7 @@ fn process_batch(
 fn process_in_batches(
     file_path: &std::path::Path,
     file_size: u64,
-) -> std::collections::BTreeMap<String, LocationStats> {
+) -> std::collections::HashMap<String, LocationStats> {
     // Create mmap once and share it across all threads
     let f = std::fs::File::open(file_path).unwrap();
     let mmap_f = unsafe { memmap2::Mmap::map(&f).unwrap() };
@@ -183,7 +188,7 @@ fn process_in_batches(
 
     let batch_size = (file_size + NUM_THREADS as u64 - 1) / NUM_THREADS as u64;
     let mut handles: std::vec::Vec<
-        std::thread::JoinHandle<std::collections::BTreeMap<String, LocationStats>>,
+        std::thread::JoinHandle<std::collections::HashMap<String, LocationStats>>,
     > = Vec::with_capacity(NUM_THREADS);
 
     for i in 0..NUM_THREADS {
@@ -195,7 +200,7 @@ fn process_in_batches(
         }));
     }
 
-    let mut m = std::collections::BTreeMap::<String, LocationStats>::new();
+    let mut m = std::collections::HashMap::<String, LocationStats>::new();
     for handle in handles {
         let batch_map = handle.join().unwrap();
         update_map(&mut m, batch_map);
@@ -207,13 +212,13 @@ fn process_in_batches(
 fn process_in_single_batch(
     file_path: &std::path::Path,
     file_size: u64,
-) -> std::collections::BTreeMap<String, LocationStats> {
+) -> std::collections::HashMap<String, LocationStats> {
     let f = std::fs::File::open(file_path).unwrap();
     let mmap_f = unsafe { memmap2::Mmap::map(&f).unwrap() };
     process_batch(0, &mmap_f, 0, file_size)
 }
 
-fn process(file_path: &std::path::Path) -> std::collections::BTreeMap<String, LocationStats> {
+fn process(file_path: &std::path::Path) -> std::collections::HashMap<String, LocationStats> {
     let f = std::fs::File::open(file_path).unwrap();
     let file_size = f.metadata().unwrap().len();
 
