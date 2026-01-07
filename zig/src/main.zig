@@ -72,19 +72,15 @@ fn updateMap(location: []const u8, temperature: i32, m: *std.StringHashMap(Locat
     }
 }
 
-fn skipToNextLine(file: std.fs.File, start_pos: usize) !u64 {
+fn skipToNextLine(mmap_file: []const u8, start_pos: usize) !u64 {
     if (start_pos == 0) return 0;
 
-    var buf: [1]u8 = undefined;
-    var reader = file.reader(&buf);
-    try reader.seekTo(start_pos - 1);
-    const prev_char = try reader.interface.takeByte();
+    const prev_char = mmap_file[start_pos - 1];
     if (prev_char == '\n') return 0;
 
-    try reader.seekTo(start_pos);
     var bytes_skipped: u64 = 0;
     while (true) {
-        const char = try reader.interface.takeByte();
+        const char = mmap_file[start_pos + @as(usize, bytes_skipped)];
         bytes_skipped += 1;
         if (char == '\n') break;
     }
@@ -97,25 +93,26 @@ fn processBatch(
     start_pos: usize,
     batch_size: u64,
     m: *std.StringHashMap(LocationStat),
-    file: std.fs.File,
+    mmap_file: []const u8,
     arena_alloc: std.mem.Allocator,
 ) !void {
     var processed_bytes: u64 = 0;
     if (thread_idx > 0) {
-        processed_bytes = try skipToNextLine(file, start_pos);
+        processed_bytes = try skipToNextLine(mmap_file, start_pos);
     }
 
-    var file_buffer: [8192]u8 = undefined;
-    var reader = file.reader(&file_buffer);
-    try reader.seekTo(start_pos + processed_bytes);
-
     while (processed_bytes < batch_size) {
-        const line = reader.interface.takeDelimiterExclusive('\n') catch |read_err| {
-            if (read_err == error.EndOfStream) {
-                break;
-            }
-            return read_err;
-        };
+        const current_pos = start_pos + @as(usize, processed_bytes);
+
+        if (current_pos >= mmap_file.len) break; // last batch may exceed file size
+
+        const relative_line_end_pos = std.mem.indexOfScalar(
+            u8,
+            mmap_file[current_pos..],
+            '\n',
+        ) orelse (mmap_file.len - current_pos); // Last line without newline
+
+        const line = mmap_file[current_pos .. current_pos + relative_line_end_pos];
 
         const location_slice, const temperature = try parseLine(line);
         try updateMap(location_slice, temperature, m, arena_alloc);
@@ -143,38 +140,39 @@ fn accumulateBatchResults(m: *std.StringHashMap(LocationStat), batch_results: *[
     }
 }
 
-fn processParallelInMultipleBatches(file_size: u64, file_path: []const u8) !void {
+fn processParallelInMultipleBatches(file_size: u64, mmap_file: []const u8) !void {
     const batch_size = (file_size + NUM_THREADS - 1) / NUM_THREADS;
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const gpa_alloc = gpa.allocator();
 
-    var handles: [NUM_THREADS]std.Thread = undefined;
+    var thread_handles: [NUM_THREADS]std.Thread = undefined;
     var m: [NUM_THREADS]std.StringHashMap(LocationStat) = undefined;
     var arenas: [NUM_THREADS]std.heap.ArenaAllocator = undefined;
-    var files: [NUM_THREADS]std.fs.File = undefined;
 
     for (0..NUM_THREADS) |i| {
         arenas[i] = std.heap.ArenaAllocator.init(gpa_alloc);
         m[i] = std.StringHashMap(LocationStat).init(arenas[i].allocator());
-        files[i] = try std.fs.cwd().openFile(file_path, .{});
     }
 
     defer {
         for (0..NUM_THREADS) |i| {
             m[i].deinit();
             arenas[i].deinit();
-            files[i].close();
         }
     }
 
     for (0..NUM_THREADS) |i| {
         const start_pos = i * batch_size;
-        handles[i] = try std.Thread.spawn(.{}, processBatch, .{ i, @as(usize, start_pos), batch_size, &m[i], files[i], arenas[i].allocator() });
+        thread_handles[i] = try std.Thread.spawn(
+            .{},
+            processBatch,
+            .{ i, @as(usize, start_pos), batch_size, &m[i], mmap_file, arenas[i].allocator() },
+        );
     }
 
     for (0..NUM_THREADS) |i| {
-        handles[i].join();
+        thread_handles[i].join();
     }
 
     var final_arena = std.heap.ArenaAllocator.init(gpa_alloc);
@@ -186,7 +184,7 @@ fn processParallelInMultipleBatches(file_size: u64, file_path: []const u8) !void
     try printResults(&final_map, final_arena.allocator());
 }
 
-fn processInSingleBatch(batch_size: u64, file_path: []const u8) !void {
+fn processInSingleBatch(batch_size: u64, mmap_file: []const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const gpa_alloc = gpa.allocator();
@@ -196,10 +194,7 @@ fn processInSingleBatch(batch_size: u64, file_path: []const u8) !void {
 
     var m = std.StringHashMap(LocationStat).init(arena_alloc);
 
-    const file = try std.fs.cwd().openFile(file_path, .{});
-    defer file.close();
-
-    try processBatch(0, 0, batch_size, &m, file, arena_alloc);
+    try processBatch(0, 0, batch_size, &m, mmap_file, arena_alloc);
     try printResults(&m, arena_alloc);
 }
 
@@ -208,10 +203,12 @@ fn onebrc(file_path: []const u8) !void {
     defer file.close();
     const file_size = (try file.stat()).size;
 
+    const mmap_file = try std.posix.mmap(null, file_size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
+
     if (file_size > 4 * 1024) {
-        try processParallelInMultipleBatches(file_size, file_path);
+        try processParallelInMultipleBatches(file_size, mmap_file);
     } else {
-        try processInSingleBatch(file_size, file_path);
+        try processInSingleBatch(file_size, mmap_file);
     }
 }
 
