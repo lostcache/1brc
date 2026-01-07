@@ -6,22 +6,102 @@ const NUM_THREADS = 8;
 const LocationStat = struct {
     min: i32,
     max: i32,
-    freq: usize,
     sum: i64,
+    freq: u32,
+    key: []const u8,
 };
 
-fn printResults(m: *const std.StringHashMap(LocationStat), allocator: std.mem.Allocator) !void {
-    var keys = std.ArrayList([]const u8){};
-    defer keys.deinit(allocator);
+const FastMap = struct {
+    const size: usize = 1 << 14;
+    const mask: usize = @This().size - 1;
+    entries: []LocationStat,
+    allocator: std.mem.Allocator,
 
-    var key_iter = m.keyIterator();
-    while (key_iter.next()) |key| {
-        try keys.append(allocator, key.*);
+    fn init(allocator: std.mem.Allocator) !FastMap {
+        const entries = try allocator.alloc(LocationStat, @This().size);
+        for (0..@This().size) |i| {
+            entries[i] = .{
+                .min = std.math.maxInt(i32),
+                .max = std.math.minInt(i32),
+                .sum = 0,
+                .freq = 0,
+                .key = undefined,
+            };
+        }
+        return FastMap{ .entries = entries, .allocator = allocator };
     }
 
-    std.mem.sort([]const u8, keys.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
+    fn deinit(self: *FastMap) void {
+        self.allocator.free(self.entries);
+    }
+
+    inline fn fast_hash(key: []const u8) u64 {
+        var hash: u64 = 0;
+        for (0..key.len) |index|
+            hash = hash * @as(u64, 1315423911) + @as(u64, key[index]);
+        return hash;
+    }
+
+    fn putOrUpdate(self: *FastMap, key: []const u8, temp: i32) void {
+        var idx = fast_hash(key) & @This().mask;
+
+        while (true) {
+            var entry = &self.entries[idx];
+
+            if (entry.freq == 0) {
+                entry.* = .{
+                    .min = temp,
+                    .max = temp,
+                    .sum = temp,
+                    .freq = 1,
+                    .key = key,
+                };
+                return;
+            }
+
+            if (std.mem.eql(u8, entry.key, key)) {
+                entry.min = @min(entry.min, temp);
+                entry.max = @max(entry.max, temp);
+                entry.sum += temp;
+                entry.freq += 1;
+                return;
+            }
+
+            idx = (idx + 1) & @This().mask;
+        }
+    }
+
+    fn putOrUpdateEntry(self: *FastMap, stat: *LocationStat) void {
+        var idx = fast_hash(stat.key) & @This().mask;
+
+        while (true) {
+            var entry = &self.entries[idx];
+
+            if (entry.freq == 0) {
+                entry.* = stat.*;
+                return;
+            }
+
+            if (std.mem.eql(u8, entry.key, stat.key)) {
+                entry.min = @min(entry.min, stat.min);
+                entry.max = @max(entry.max, stat.max);
+                entry.sum += stat.sum;
+                entry.freq += stat.freq;
+                return;
+            }
+
+            idx = (idx + 1) & @This().mask;
+        }
+    }
+};
+fn printResults(m: *const FastMap) !void {
+    std.mem.sort(LocationStat, m.entries, {}, struct {
+        fn lessThan(_: void, a: LocationStat, b: LocationStat) bool {
+            // Sort non-empty entries before empty ones, then by key
+            if (a.freq == 0 and b.freq == 0) return false;
+            if (a.freq == 0) return false;
+            if (b.freq == 0) return true;
+            return std.mem.order(u8, a.key, b.key) == .lt;
         }
     }.lessThan);
 
@@ -30,14 +110,17 @@ fn printResults(m: *const std.StringHashMap(LocationStat), allocator: std.mem.Al
     const writer = &stdout_writer.interface;
 
     try writer.writeAll("{");
-    for (keys.items, 0..) |location, i| {
-        const stat = m.get(location).?;
+    var first = true;
+    for (m.entries) |stat| {
+        if (stat.freq == 0) break; // All remaining entries are empty
+
         const mean = @as(f64, @floatFromInt(stat.sum)) / @as(f64, @floatFromInt(stat.freq));
 
-        if (i > 0) try writer.writeAll(", ");
+        if (!first) try writer.writeAll(", ");
+        first = false;
 
         try writer.print("{s}={d:.1}/{d:.1}/{d:.1}", .{
-            location,
+            stat.key,
             @as(f64, @floatFromInt(stat.min)) / 10.0,
             mean / 10.0,
             @as(f64, @floatFromInt(stat.max)) / 10.0,
@@ -47,13 +130,32 @@ fn printResults(m: *const std.StringHashMap(LocationStat), allocator: std.mem.Al
     try writer.flush();
 }
 
-fn parseLine(line: []const u8) !struct { []const u8, i32 } {
-    const semicol_pos = std.mem.indexOfScalar(u8, line, ';').?;
-    const temperature = try std.fmt.parseFloat(f32, line[semicol_pos + 1 ..]);
-    return .{ line[0..semicol_pos], @as(i32, @intFromFloat(temperature * 10.0)) };
+fn parse_int(val_slice: []const u8) i32 {
+    var is_negative = false;
+    var start_pos: usize = 0;
+    var val: i32 = undefined;
+
+    if (val_slice[0] == '-') {
+        is_negative = true;
+        start_pos = 1;
+    }
+
+    if (val_slice[start_pos + 1] == '.') {
+        val = @as(i32, val_slice[start_pos] - '0') * 10 + @as(i32, val_slice[start_pos + 2] - '0');
+    } else {
+        val = @as(i32, val_slice[start_pos] - '0') * 100 + @as(i32, val_slice[start_pos + 1] - '0') * 10 + @as(i32, val_slice[start_pos + 3] - '0');
+    }
+
+    return if (is_negative) -val else val;
 }
 
-fn updateMap(location: []const u8, temperature: i32, m: *std.StringHashMap(LocationStat), allocator: std.mem.Allocator) !void {
+fn parseLine(line: []const u8) !struct { []const u8, i32 } {
+    const semicol_pos = std.mem.indexOfScalar(u8, line, ';').?;
+    const temperature = parse_int(line[semicol_pos + 1 ..]);
+    return .{ line[0..semicol_pos], temperature };
+}
+
+fn updateMap(location: []const u8, temperature: i32, m: *FastMap, allocator: std.mem.Allocator) !void {
     const entry = try m.getOrPut(location);
     if (!entry.found_existing) {
         entry.key_ptr.* = try allocator.dupe(u8, location);
@@ -92,9 +194,8 @@ fn processBatch(
     thread_idx: usize,
     start_pos: usize,
     batch_size: u64,
-    m: *std.StringHashMap(LocationStat),
+    m: *FastMap,
     mmap_file: []const u8,
-    arena_alloc: std.mem.Allocator,
 ) !void {
     var processed_bytes: u64 = 0;
     if (thread_idx > 0) {
@@ -115,27 +216,17 @@ fn processBatch(
         const line = mmap_file[current_pos .. current_pos + relative_line_end_pos];
 
         const location_slice, const temperature = try parseLine(line);
-        try updateMap(location_slice, temperature, m, arena_alloc);
+        m.putOrUpdate(location_slice, temperature);
 
         processed_bytes += line.len + 1;
     }
 }
 
-fn accumulateBatchResults(m: *std.StringHashMap(LocationStat), batch_results: *[NUM_THREADS]std.StringHashMap(LocationStat)) !void {
+fn accumulateBatchResults(m: *FastMap, batch_results: *[NUM_THREADS]FastMap) void {
     for (batch_results) |batch_map| {
-        var key_iter = batch_map.keyIterator();
-        while (key_iter.next()) |location_slice| {
-            const result = try m.getOrPut(location_slice.*);
-            if (!result.found_existing) {
-                result.key_ptr.* = location_slice.*;
-                result.value_ptr.* = batch_map.get(location_slice.*).?;
-            } else {
-                const batch_stat = batch_map.get(location_slice.*).?;
-                result.value_ptr.min = @min(result.value_ptr.min, batch_stat.min);
-                result.value_ptr.max = @max(result.value_ptr.max, batch_stat.max);
-                result.value_ptr.sum += batch_stat.sum;
-                result.value_ptr.freq += batch_stat.freq;
-            }
+        for (batch_map.entries) |*entry| {
+            if (entry.freq == 0) continue; // Skip empty entries
+            m.putOrUpdateEntry(entry);
         }
     }
 }
@@ -147,12 +238,12 @@ fn processParallelInMultipleBatches(file_size: u64, mmap_file: []const u8) !void
     const gpa_alloc = gpa.allocator();
 
     var thread_handles: [NUM_THREADS]std.Thread = undefined;
-    var m: [NUM_THREADS]std.StringHashMap(LocationStat) = undefined;
+    var m: [NUM_THREADS]FastMap = undefined;
     var arenas: [NUM_THREADS]std.heap.ArenaAllocator = undefined;
 
     for (0..NUM_THREADS) |i| {
         arenas[i] = std.heap.ArenaAllocator.init(gpa_alloc);
-        m[i] = std.StringHashMap(LocationStat).init(arenas[i].allocator());
+        m[i] = try FastMap.init(arenas[i].allocator());
     }
 
     defer {
@@ -167,7 +258,7 @@ fn processParallelInMultipleBatches(file_size: u64, mmap_file: []const u8) !void
         thread_handles[i] = try std.Thread.spawn(
             .{},
             processBatch,
-            .{ i, @as(usize, start_pos), batch_size, &m[i], mmap_file, arenas[i].allocator() },
+            .{ i, @as(usize, start_pos), batch_size, &m[i], mmap_file },
         );
     }
 
@@ -177,11 +268,11 @@ fn processParallelInMultipleBatches(file_size: u64, mmap_file: []const u8) !void
 
     var final_arena = std.heap.ArenaAllocator.init(gpa_alloc);
     defer final_arena.deinit();
-    var final_map = std.StringHashMap(LocationStat).init(final_arena.allocator());
+    var final_map = try FastMap.init(final_arena.allocator());
     defer final_map.deinit();
 
-    try accumulateBatchResults(&final_map, &m);
-    try printResults(&final_map, final_arena.allocator());
+    accumulateBatchResults(&final_map, &m);
+    try printResults(&final_map);
 }
 
 fn processInSingleBatch(batch_size: u64, mmap_file: []const u8) !void {
@@ -191,11 +282,10 @@ fn processInSingleBatch(batch_size: u64, mmap_file: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(gpa_alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
+    var m = try FastMap.init(arena_alloc);
 
-    var m = std.StringHashMap(LocationStat).init(arena_alloc);
-
-    try processBatch(0, 0, batch_size, &m, mmap_file, arena_alloc);
-    try printResults(&m, arena_alloc);
+    try processBatch(0, 0, batch_size, &m, mmap_file);
+    try printResults(&m);
 }
 
 fn onebrc(file_path: []const u8) !void {
