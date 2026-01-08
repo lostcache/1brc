@@ -42,19 +42,20 @@ const FastMap = struct {
         return hash;
     }
 
-    fn putOrUpdate(self: *FastMap, key: []const u8, temp: i32) void {
+    fn putOrUpdate(self: *FastMap, key: []const u8, temp: i32, allocator: std.mem.Allocator) !void {
         var idx = fast_hash(key) & @This().mask;
 
         while (true) {
             var entry = &self.entries[idx];
 
             if (entry.freq == 0) {
+                const key_copy = try allocator.dupe(u8, key);
                 entry.* = .{
                     .min = temp,
                     .max = temp,
                     .sum = temp,
                     .freq = 1,
-                    .key = key,
+                    .key = key_copy,
                 };
                 return;
             }
@@ -174,15 +175,19 @@ fn updateMap(location: []const u8, temperature: i32, m: *FastMap, allocator: std
     }
 }
 
-fn skipToNextLine(mmap_file: []const u8, start_pos: usize) !u64 {
+fn skipToNextLine(file: std.fs.File, start_pos: usize) !u64 {
     if (start_pos == 0) return 0;
 
-    const prev_char = mmap_file[start_pos - 1];
+    var buf: [1]u8 = undefined;
+    var reader = file.reader(&buf);
+    try reader.seekTo(start_pos - 1);
+    const prev_char = try reader.interface.takeByte();
     if (prev_char == '\n') return 0;
 
+    try reader.seekTo(start_pos);
     var bytes_skipped: u64 = 0;
     while (true) {
-        const char = mmap_file[start_pos + @as(usize, bytes_skipped)];
+        const char = try reader.interface.takeByte();
         bytes_skipped += 1;
         if (char == '\n') break;
     }
@@ -195,28 +200,28 @@ fn processBatch(
     start_pos: usize,
     batch_size: u64,
     m: *FastMap,
-    mmap_file: []const u8,
+    file: std.fs.File,
+    arena_alloc: std.mem.Allocator,
 ) !void {
     var processed_bytes: u64 = 0;
     if (thread_idx > 0) {
-        processed_bytes = try skipToNextLine(mmap_file, start_pos);
+        processed_bytes = try skipToNextLine(file, start_pos);
     }
 
+    var file_buffer: [8192]u8 = undefined;
+    var reader = file.reader(&file_buffer);
+    try reader.seekTo(start_pos + processed_bytes);
+
     while (processed_bytes < batch_size) {
-        const current_pos = start_pos + @as(usize, processed_bytes);
-
-        if (current_pos >= mmap_file.len) break; // last batch may exceed file size
-
-        const relative_line_end_pos = std.mem.indexOfScalar(
-            u8,
-            mmap_file[current_pos..],
-            '\n',
-        ) orelse (mmap_file.len - current_pos); // Last line without newline
-
-        const line = mmap_file[current_pos .. current_pos + relative_line_end_pos];
+        const line = reader.interface.takeDelimiterExclusive('\n') catch |read_err| {
+            if (read_err == error.EndOfStream) {
+                break;
+            }
+            return read_err;
+        };
 
         const location_slice, const temperature = try parseLine(line);
-        m.putOrUpdate(location_slice, temperature);
+        try m.putOrUpdate(location_slice, temperature, arena_alloc);
 
         processed_bytes += line.len + 1;
     }
@@ -231,7 +236,7 @@ fn accumulateBatchResults(m: *FastMap, batch_results: *[NUM_THREADS]FastMap) voi
     }
 }
 
-fn processParallelInMultipleBatches(file_size: u64, mmap_file: []const u8) !void {
+fn processParallelInMultipleBatches(file_size: u64, file_path: []const u8) !void {
     const batch_size = (file_size + NUM_THREADS - 1) / NUM_THREADS;
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -240,16 +245,19 @@ fn processParallelInMultipleBatches(file_size: u64, mmap_file: []const u8) !void
     var thread_handles: [NUM_THREADS]std.Thread = undefined;
     var m: [NUM_THREADS]FastMap = undefined;
     var arenas: [NUM_THREADS]std.heap.ArenaAllocator = undefined;
+    var files: [NUM_THREADS]std.fs.File = undefined;
 
     for (0..NUM_THREADS) |i| {
         arenas[i] = std.heap.ArenaAllocator.init(gpa_alloc);
         m[i] = try FastMap.init(arenas[i].allocator());
+        files[i] = try std.fs.cwd().openFile(file_path, .{});
     }
 
     defer {
         for (0..NUM_THREADS) |i| {
             m[i].deinit();
             arenas[i].deinit();
+            files[i].close();
         }
     }
 
@@ -258,7 +266,7 @@ fn processParallelInMultipleBatches(file_size: u64, mmap_file: []const u8) !void
         thread_handles[i] = try std.Thread.spawn(
             .{},
             processBatch,
-            .{ i, @as(usize, start_pos), batch_size, &m[i], mmap_file },
+            .{ i, @as(usize, start_pos), batch_size, &m[i], files[i], arenas[i].allocator() },
         );
     }
 
@@ -275,7 +283,7 @@ fn processParallelInMultipleBatches(file_size: u64, mmap_file: []const u8) !void
     try printResults(&final_map);
 }
 
-fn processInSingleBatch(batch_size: u64, mmap_file: []const u8) !void {
+fn processInSingleBatch(batch_size: u64, file_path: []const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const gpa_alloc = gpa.allocator();
@@ -284,7 +292,10 @@ fn processInSingleBatch(batch_size: u64, mmap_file: []const u8) !void {
     const arena_alloc = arena.allocator();
     var m = try FastMap.init(arena_alloc);
 
-    try processBatch(0, 0, batch_size, &m, mmap_file);
+    const file = try std.fs.cwd().openFile(file_path, .{});
+    defer file.close();
+
+    try processBatch(0, 0, batch_size, &m, file, arena_alloc);
     try printResults(&m);
 }
 
@@ -293,12 +304,10 @@ fn onebrc(file_path: []const u8) !void {
     defer file.close();
     const file_size = (try file.stat()).size;
 
-    const mmap_file = try std.posix.mmap(null, file_size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
-
     if (file_size > 4 * 1024) {
-        try processParallelInMultipleBatches(file_size, mmap_file);
+        try processParallelInMultipleBatches(file_size, file_path);
     } else {
-        try processInSingleBatch(file_size, mmap_file);
+        try processInSingleBatch(file_size, file_path);
     }
 }
 
@@ -314,3 +323,4 @@ pub fn main() !void {
 
     try onebrc(file_path);
 }
+
