@@ -5,20 +5,60 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <limits>
 #include <string>
 #include <string_view>
-#include <sys/cdefs.h>
-#include <sys/fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <thread>
-#include <unistd.h>
 #include <vector>
 
+// Linux-specific headers
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <thread>
+#include <unistd.h>
+
+// Branch prediction hints
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
 constexpr size_t NUM_THREADS = 8;
+constexpr size_t BUFFER_SIZE = 64 * 1024;
+
+class Arena {
+  private:
+    static constexpr size_t CHUNK_SIZE = 1024 * 1024;
+    std::vector<char*> chunks;
+    char* current;
+    size_t remaining;
+
+  public:
+    Arena() : current(nullptr), remaining(0) {}
+
+    ~Arena() {
+        for (char* chunk : chunks) {
+            delete[] chunk;
+        }
+    }
+
+    char* allocate(size_t size) {
+        if (size > remaining) {
+            size_t allocSize = std::max(CHUNK_SIZE, size);
+            current = new char[allocSize];
+            chunks.push_back(current);
+            remaining = allocSize;
+        }
+        char* result = current;
+        current += size;
+        remaining -= size;
+        return result;
+    }
+
+    Arena(const Arena&) = delete;
+    Arena& operator=(const Arena&) = delete;
+};
 
 class FastMap {
   private:
@@ -27,97 +67,127 @@ class FastMap {
         int32_t max;
         size_t freq;
         int64_t sum;
-        std::string location;
+        const char* location;
+        size_t location_len;
         LocationEntry_() {
             min = std::numeric_limits<int32_t>::max();
             max = std::numeric_limits<int32_t>::min();
             freq = 0;
             sum = 0;
+            location = nullptr;
+            location_len = 0;
         }
     };
     std::vector<LocationEntry_> data;
     size_t capacity_;
     size_t mask_;
+    Arena* arena;
 
-    size_t fast_hash(std::string_view sv) {
-        assert(!sv.empty());
-
+    __attribute__((hot)) inline size_t fast_hash(const char* data, size_t len) const {
         uint64_t hash = 0;
-        for (size_t index = 0; index < sv.size(); ++index)
-            hash = hash * 1315423911u + static_cast<unsigned char>(sv[index]);
+        for (size_t index = 0; index < len; ++index)
+            hash = hash * 1315423911u + static_cast<unsigned char>(data[index]);
         return hash;
     }
 
-    size_t getIdx(std::string_view queryLocation) {
-        assert(!queryLocation.empty());
+    __attribute__((hot)) inline bool str_equal(const char* a, size_t a_len, const char* b, size_t b_len) const {
+        return a_len == b_len && memcmp(a, b, a_len) == 0;
+    }
 
-        size_t hash = fast_hash(queryLocation);
+    __attribute__((hot)) size_t getIdx(const char* queryLocation, size_t len) {
+        size_t hash = fast_hash(queryLocation, len);
         size_t idx = hash & this->mask_;
         while (true) {
-            const auto& location = this->data[idx].location;
-            if (location.size() <= 0 || location == queryLocation) {
+            auto& entry = this->data[idx];
+            // Most lookups find the entry on first try (empty or match)
+            if (likely(entry.freq == 0 || str_equal(entry.location, entry.location_len, queryLocation, len))) {
                 return idx;
             }
             idx = (idx + 1) & mask_;
         }
     }
 
-    double roundTowardsINF(double value) const { return std::round(value * 10.0) / 10.0; }
+    // Optimized rounding: avoid std::round overhead by using direct arithmetic
+    // This is equivalent to round(value * 10.0) / 10.0 but faster
+    // Handles both positive and negative numbers correctly
+    double roundTowardsINF(double value) const {
+        double scaled = value * 10.0;
+        // Use conditional to handle negative numbers correctly (round away from zero)
+        return (scaled >= 0.0) ? std::floor(scaled + 0.5) / 10.0 : std::ceil(scaled - 0.5) / 10.0;
+    }
 
     bool sortInplace() {
         assert(this->data.size() > 0);
 
         std::sort(this->data.begin(), this->data.end(),
                   [](const LocationEntry_& a, const LocationEntry_& b) {
-                      return a.location < b.location;
+                      if (a.freq == 0 && b.freq == 0) return false;
+                      if (a.freq == 0) return false;
+                      if (b.freq == 0) return true;
+                      int cmp = memcmp(a.location, b.location, std::min(a.location_len, b.location_len));
+                      if (cmp != 0) return cmp < 0;
+                      return a.location_len < b.location_len;
                   });
 
         return true;
     }
 
   public:
-    FastMap(size_t initCap = 1 << 14) : capacity_(initCap), mask_(initCap - 1) {
+    FastMap(Arena* arena, size_t initCap = 1 << 14)
+        : capacity_(initCap), mask_(initCap - 1), arena(arena) {
         this->data.resize(initCap, LocationEntry_());
     }
 
     size_t size() const { return this->capacity_; }
 
-    __attribute__((hot)) bool update(std::string_view location, int32_t temperature) {
-        assert(!location.empty());
+    __attribute__((hot)) inline void update(const char* location, size_t len, int32_t temperature) {
+        size_t idx = this->getIdx(location, len);
 
-        size_t idx = this->getIdx(location);
-
-        assert(idx >= 0 && idx < this->capacity_);
-
-        if (this->data[idx].location.size() <= 0) {
-            this->data[idx].location = std::string(location);
+        auto& entry = this->data[idx];
+        if (likely(entry.freq != 0)) {
+            // Existing entry - just update (most common case in 1BRC)
+            entry.min = std::min(entry.min, temperature);
+            entry.max = std::max(entry.max, temperature);
+            entry.sum += temperature;
+            entry.freq += 1;
+        } else {
+            // New entry - allocate from arena (rare after warmup)
+            char* key_copy = arena->allocate(len);
+            memcpy(key_copy, location, len);
+            entry.location = key_copy;
+            entry.location_len = len;
+            entry.min = temperature;
+            entry.max = temperature;
+            entry.sum = temperature;
+            entry.freq = 1;
         }
-        this->data[idx].freq += 1;
-        this->data[idx].sum += temperature;
-        this->data[idx].min = std::min(this->data[idx].min, temperature);
-        this->data[idx].max = std::max(this->data[idx].max, temperature);
-
-        return true;
     }
 
-    bool update(const FastMap& other) {
+    void mergeFrom(const FastMap& other) {
         for (size_t i = 0; i < other.size(); ++i) {
-            const auto& otherLocation = other.data[i].location;
+            const auto& otherEntry = other.data[i];
 
-            if (otherLocation.size() <= 0) continue;
+            if (otherEntry.freq == 0) continue;
 
-            size_t thisIdx = this->getIdx(otherLocation);
+            size_t idx = this->getIdx(otherEntry.location, otherEntry.location_len);
+            auto& thisEntry = this->data[idx];
 
-            if (this->data[thisIdx].location.size() <= 0) {
-                this->data[thisIdx].location = otherLocation;
+            if (thisEntry.freq == 0) {
+                char* key_copy = arena->allocate(otherEntry.location_len);
+                memcpy(key_copy, otherEntry.location, otherEntry.location_len);
+                thisEntry.location = key_copy;
+                thisEntry.location_len = otherEntry.location_len;
+                thisEntry.min = otherEntry.min;
+                thisEntry.max = otherEntry.max;
+                thisEntry.sum = otherEntry.sum;
+                thisEntry.freq = otherEntry.freq;
+            } else {
+                thisEntry.freq += otherEntry.freq;
+                thisEntry.sum += otherEntry.sum;
+                thisEntry.min = std::min(thisEntry.min, otherEntry.min);
+                thisEntry.max = std::max(thisEntry.max, otherEntry.max);
             }
-            this->data[thisIdx].freq += other.data[i].freq;
-            this->data[thisIdx].sum += other.data[i].sum;
-            this->data[thisIdx].min = std::min(this->data[thisIdx].min, other.data[i].min);
-            this->data[thisIdx].max = std::max(this->data[thisIdx].max, other.data[i].max);
         }
-
-        return true;
     }
 
     void printSorted() {
@@ -127,13 +197,11 @@ class FastMap {
         outBuffer.reserve(2 * 1024 * 1024);
 
         for (const auto& locEntry : this->data) {
-            const auto& location = locEntry.location;
-
-            if (location.size() <= 0) continue;
+            if (locEntry.freq == 0) break; // All remaining are empty
 
             if (outBuffer.size() > 1) outBuffer += ", ";
 
-            outBuffer += location;
+            outBuffer.append(locEntry.location, locEntry.location_len);
             outBuffer += "=";
 
             double min_val = locEntry.min / 10.0;
@@ -151,41 +219,12 @@ class FastMap {
     }
 };
 
-struct MMAPFile {
-    const char* filePtr;
-    const size_t fileSize;
-};
-
 size_t getFileSize(const std::string& fileName) { return std::filesystem::file_size(fileName); }
-
-MMAPFile getMmappedFile(const char* fileName) {
-    int fd = open(fileName, O_RDONLY);
-
-    if (fd == -1) {
-        std::cerr << "Could not read input file" << std::endl;
-        std::exit(EXIT_FAILURE);
-    }
-
-    size_t fileSize = getFileSize(fileName);
-
-    char* map = static_cast<char*>(mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0));
-
-    close(fd);
-
-    if (map == MAP_FAILED) {
-        std::cerr << "Cound not use mmap on the file" << std::endl;
-        std::exit(EXIT_FAILURE);
-    }
-
-    return {map, fileSize};
-}
-
-void unMapFile(MMAPFile f) { munmap(const_cast<char*>(f.filePtr), f.fileSize); }
 
 size_t getBatchSize(size_t fileSize) { return (fileSize + (NUM_THREADS - 1)) / NUM_THREADS; }
 
 // Assumes format: [-]D[D].D where D is digit
-int32_t parseInt32(const char* start) {
+__attribute__((hot)) inline int32_t parseInt32(const char* start) {
     int32_t value = 0;
     bool isNegative = false;
 
@@ -194,111 +233,190 @@ int32_t parseInt32(const char* start) {
         start++;
     }
 
-    value = (start[0] - '0') * 10 + start[2] - '0';
-
-    if (start[2] == '.') {
+    if (start[1] == '.') {
+        value = (start[0] - '0') * 10 + start[2] - '0';
+    } else {
         value = (start[0] - '0') * 100 + (start[1] - '0') * 10 + start[3] - '0';
     }
 
     return isNegative ? -value : value;
 }
 
-std::pair<std::string_view, int32_t> parseLine(std::string_view line) {
-    assert(!line.empty());
-
-    size_t semicolonPos = line.find(';');
-    assert(semicolonPos != std::string_view::npos);
-    std::string_view locationView = line.substr(0, semicolonPos);
-
-    // Find start and end of temperature
-    size_t tempStart = semicolonPos + 1;
-    assert(tempStart < line.size());
-
-    // Trim trailing whitespace
-    size_t tempEnd = line.size();
-    while (tempEnd > tempStart && (line[tempEnd - 1] == ' ' || line[tempEnd - 1] == '\t' ||
-                                   line[tempEnd - 1] == '\n' || line[tempEnd - 1] == '\r')) {
-        --tempEnd;
+// Semicolon is always at len - 4, len - 5, or len - 6
+// Temperature format: [-]D[D].D (3-5 chars + semicolon)
+__attribute__((hot)) inline std::pair<std::string_view, int32_t> parseLine(std::string_view line) {
+    size_t len = line.size();
+    
+    size_t semicolonPos;
+    if (line[len - 4] == ';') {
+        semicolonPos = len - 4;
+    } else if (line[len - 5] == ';') {
+        semicolonPos = len - 5;
+    } else {
+        semicolonPos = len - 6;
     }
 
-    assert(tempEnd > tempStart);
-
-    const char* start = line.data() + tempStart;
-    int32_t temp_int = parseInt32(start);
+    std::string_view locationView(line.data(), semicolonPos);
+    int32_t temp_int = parseInt32(line.data() + semicolonPos + 1);
 
     return std::make_pair(locationView, temp_int);
 }
 
-size_t skipTillNextLine(size_t startPos, MMAPFile f) {
-    assert(startPos > 0);
+class BufferedFileReader {
+  private:
+    int fd;
+    char buffer[BUFFER_SIZE];
+    char lineBuffer[256];
+    size_t lineBufferUsed;
+    size_t bufferPos;
+    size_t bufferEnd;
+    bool eof;
 
-    const char* prevChar = f.filePtr + startPos - 1;
-    if (*prevChar == '\n') {
-        return 0;
+  public:
+    BufferedFileReader(int fd, size_t startPos)
+        : fd(fd), lineBufferUsed(0), bufferPos(0), bufferEnd(0), eof(false) {
+        lseek(fd, startPos, SEEK_SET);
     }
 
+    __attribute__((hot)) bool readLine(std::string_view& line, size_t& bytesRead) {
+        lineBufferUsed = 0;
+        bytesRead = 0;
+
+        while (true) {
+            if (bufferPos >= bufferEnd) {
+                ssize_t n = read(fd, buffer, BUFFER_SIZE);
+                if (n <= 0) {
+                    eof = true;
+                    if (lineBufferUsed > 0) {
+                        line = std::string_view(lineBuffer, lineBufferUsed);
+                        bytesRead = lineBufferUsed;
+                        return true;
+                    }
+                    return false;
+                }
+                bufferEnd = n;
+                bufferPos = 0;
+            }
+
+            const char* start = buffer + bufferPos;
+            const char* newline_ptr =
+                static_cast<const char*>(memchr(start, '\n', bufferEnd - bufferPos));
+
+            if (likely(newline_ptr != nullptr)) {
+                size_t chunkSize = newline_ptr - start;
+
+                if (likely(lineBufferUsed == 0)) {
+                    line = std::string_view(start, chunkSize);
+                    bytesRead = chunkSize + 1;
+                    bufferPos = (newline_ptr - buffer) + 1;
+                    return true;
+                } else {
+                    memcpy(lineBuffer + lineBufferUsed, start, chunkSize);
+                    lineBufferUsed += chunkSize;
+                    line = std::string_view(lineBuffer, lineBufferUsed);
+                    bytesRead = lineBufferUsed + 1;
+                    bufferPos = (newline_ptr - buffer) + 1;
+                    return true;
+                }
+            } else {
+                size_t remaining = bufferEnd - bufferPos;
+                if (lineBufferUsed + remaining < sizeof(lineBuffer)) {
+                    memcpy(lineBuffer + lineBufferUsed, start, remaining);
+                    lineBufferUsed += remaining;
+                }
+                bytesRead += remaining;
+                bufferPos = bufferEnd;
+            }
+        }
+    }
+
+    bool isEof() const { return eof; }
+};
+
+size_t skipToNextLine(int fd, size_t startPos) {
+    if (startPos == 0) return 0;
+
+    // Check previous character
+    char prevChar;
+    lseek(fd, startPos - 1, SEEK_SET);
+    if (read(fd, &prevChar, 1) != 1) return 0;
+    if (prevChar == '\n') return 0;
+
+    // Skip to next newline
+    lseek(fd, startPos, SEEK_SET);
     size_t bytesSkipped = 0;
-    while (*(f.filePtr + startPos + bytesSkipped) != '\n') {
+    char c;
+    while (read(fd, &c, 1) == 1) {
         bytesSkipped++;
+        if (c == '\n') break;
     }
-
-    bytesSkipped++; // skip '\n'
-
-    assert(bytesSkipped > 0);
 
     return bytesSkipped;
 }
 
-void processLinesInCurrBatch(size_t startPos, size_t batchEndPos, MMAPFile f, FastMap& m) {
-    size_t pos = startPos;
+void processBatch(size_t threadIndex, size_t startPos, size_t batchSize, FastMap& m,
+                  const char* filename) {
+    // Pin thread to CPU core (Linux-specific)
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(threadIndex % std::thread::hardware_concurrency(), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
-    while (pos < batchEndPos && pos < f.fileSize) {
-        size_t newlinePos = pos;
-        while (newlinePos < f.fileSize && *(f.filePtr + newlinePos) != '\n') {
-            ++newlinePos;
+    int fd = open(filename, O_RDONLY);
+    if (fd == -1) {
+        std::cerr << "Could not open file in thread " << threadIndex << std::endl;
+        return;
+    }
+
+    // Tell kernel we're reading sequentially
+    posix_fadvise(fd, startPos, batchSize, POSIX_FADV_SEQUENTIAL | POSIX_FADV_WILLNEED);
+
+    size_t processedBytes = 0;
+    if (threadIndex > 0) {
+        processedBytes = skipToNextLine(fd, startPos);
+    }
+
+    BufferedFileReader reader(fd, startPos + processedBytes);
+    std::string_view line;
+    size_t lineBytes;
+
+    while (processedBytes < batchSize) {
+        if (!reader.readLine(line, lineBytes)) {
+            break;
         }
 
-        std::string_view line(f.filePtr + pos, newlinePos - pos);
+        if (likely(!line.empty())) {
+            auto [location, temperature] = parseLine(line);
+            m.update(location.data(), location.size(), temperature);
+        }
 
-        assert(!line.empty());
-
-        auto result = parseLine(line);
-        auto [location, temperature] = result;
-        m.update(location, temperature);
-
-        pos = newlinePos + 1;
-    }
-}
-
-void accumulateBatch(size_t threadIndex, size_t startPos, size_t batchSizeBytes, FastMap& m,
-                     MMAPFile f) {
-    assert(batchSizeBytes > 0);
-
-    size_t batchEnd = startPos + batchSizeBytes;
-
-    // Skip to the next line boundary at the start for non-zero threads
-    if (threadIndex > 0) {
-        size_t bytesSkipped = skipTillNextLine(startPos, f);
-        startPos += bytesSkipped;
+        processedBytes += lineBytes;
     }
 
-    processLinesInCurrBatch(startPos, batchEnd, f, m);
+    close(fd);
 }
 
 void accumulateThreadResults(const std::vector<FastMap>& maps, FastMap& finalMap) {
     for (const auto& m : maps) {
-        finalMap.update(m);
+        finalMap.mergeFrom(m);
     }
 }
 
-void processInBatches(MMAPFile f, size_t batchSize, FastMap& finalMap) {
-    std::vector<FastMap> maps(NUM_THREADS, FastMap());
+void processInBatches(const char* filename, size_t fileSize, FastMap& finalMap) {
+    size_t batchSize = getBatchSize(fileSize);
+
+    std::vector<Arena> arenas(NUM_THREADS);
+    std::vector<FastMap> maps;
+    maps.reserve(NUM_THREADS);
+    for (size_t i = 0; i < NUM_THREADS; ++i) {
+        maps.emplace_back(&arenas[i]);
+    }
 
     std::vector<std::thread> threads;
     threads.reserve(NUM_THREADS);
     for (size_t i = 0; i < NUM_THREADS; ++i) {
         size_t startPos = i * batchSize;
-        threads.emplace_back(accumulateBatch, i, startPos, batchSize, std::ref(maps[i]), f);
+        threads.emplace_back(processBatch, i, startPos, batchSize, std::ref(maps[i]), filename);
     }
 
     for (auto& t : threads) {
@@ -308,33 +426,25 @@ void processInBatches(MMAPFile f, size_t batchSize, FastMap& finalMap) {
     accumulateThreadResults(maps, finalMap);
 }
 
-void processLinesInSingleBatch(MMAPFile f, FastMap& finalMap) {
-    accumulateBatch(0, 0, f.fileSize, finalMap, f);
-}
-
-void accumulate(MMAPFile f, FastMap& finalMap) {
-    size_t batchSize = getBatchSize(f.fileSize);
-
-    assert(batchSize > 0);
-
-    if (batchSize > 4 * 1024) {
-        processInBatches(f, batchSize, finalMap);
-    } else {
-        processLinesInSingleBatch(f, finalMap);
-    }
+void processInSingleBatch(const char* filename, size_t fileSize, FastMap& finalMap) {
+    processBatch(0, 0, fileSize, finalMap, filename);
 }
 
 void oneBrc(const char* filename) {
-    MMAPFile f = getMmappedFile(filename);
+    size_t fileSize = std::filesystem::file_size(filename);
 
-    FastMap finalMap;
-    accumulate(f, finalMap);
+    Arena finalArena;
+    FastMap finalMap(&finalArena);
+
+    if (fileSize > 4 * 1024) {
+        processInBatches(filename, fileSize, finalMap);
+    } else {
+        processInSingleBatch(filename, fileSize, finalMap);
+    }
 
     std::cout << '{';
     finalMap.printSorted();
     std::cout << "}\n";
-
-    unMapFile(f);
 }
 
 int main(int argc, char* argv[]) {

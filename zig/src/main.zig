@@ -1,7 +1,10 @@
 const std = @import("std");
+const posix = std.posix;
+const linux = std.os.linux;
 
 const FILE_PATH = "/root/code/1brc/data/measurements.txt";
 const NUM_THREADS = 8;
+const BUFFER_SIZE = 64 * 1024;
 
 const LocationStat = struct {
     min: i32,
@@ -175,21 +178,87 @@ fn updateMap(location: []const u8, temperature: i32, m: *FastMap, allocator: std
     }
 }
 
-fn skipToNextLine(file: std.fs.File, start_pos: usize) !u64 {
+const BufferedReader = struct {
+    fd: posix.fd_t,
+    buffer: [BUFFER_SIZE]u8 = undefined,
+    line_buffer: [256]u8 = undefined,
+    line_buffer_used: usize = 0,
+    buffer_pos: usize = 0,
+    buffer_end: usize = 0,
+    eof: bool = false,
+
+    fn init(fd: posix.fd_t, start_pos: usize) BufferedReader {
+        const self = BufferedReader{ .fd = fd };
+        _ = linux.lseek(fd, @intCast(start_pos), linux.SEEK.SET);
+        return self;
+    }
+
+    inline fn readLine(self: *BufferedReader) ?[]const u8 {
+        self.line_buffer_used = 0;
+
+        while (true) {
+            // Refill buffer if needed
+            if (self.buffer_pos >= self.buffer_end) {
+                const n = posix.read(self.fd, &self.buffer) catch 0;
+                if (n == 0) {
+                    self.eof = true;
+                    if (self.line_buffer_used > 0) {
+                        return self.line_buffer[0..self.line_buffer_used];
+                    }
+                    return null;
+                }
+                self.buffer_end = n;
+                self.buffer_pos = 0;
+            }
+
+            // Find newline using SIMD-optimized indexOfScalar
+            const start = self.buffer[self.buffer_pos..self.buffer_end];
+            if (std.mem.indexOfScalar(u8, start, '\n')) |newline_offset| {
+                const chunk_size = newline_offset;
+
+                if (self.line_buffer_used == 0) {
+                    // Fast path: complete line in buffer
+                    const line = start[0..chunk_size];
+                    self.buffer_pos += chunk_size + 1;
+                    return line;
+                } else {
+                    // Slow path: append final chunk
+                    @memcpy(self.line_buffer[self.line_buffer_used..][0..chunk_size], start[0..chunk_size]);
+                    self.line_buffer_used += chunk_size;
+                    self.buffer_pos += chunk_size + 1;
+                    return self.line_buffer[0..self.line_buffer_used];
+                }
+            } else {
+                // No newline - accumulate and continue
+                const remaining = self.buffer_end - self.buffer_pos;
+                if (self.line_buffer_used + remaining < self.line_buffer.len) {
+                    @memcpy(self.line_buffer[self.line_buffer_used..][0..remaining], start[0..remaining]);
+                    self.line_buffer_used += remaining;
+                }
+                self.buffer_pos = self.buffer_end;
+            }
+        }
+    }
+};
+
+fn skipToNextLine(fd: posix.fd_t, start_pos: usize) usize {
     if (start_pos == 0) return 0;
 
-    var buf: [1]u8 = undefined;
-    var reader = file.reader(&buf);
-    try reader.seekTo(start_pos - 1);
-    const prev_char = try reader.interface.takeByte();
-    if (prev_char == '\n') return 0;
+    // Check previous character
+    _ = linux.lseek(fd, @intCast(start_pos - 1), linux.SEEK.SET);
+    var prev_char: [1]u8 = undefined;
+    const n = posix.read(fd, &prev_char) catch return 0;
+    if (n == 0 or prev_char[0] == '\n') return 0;
 
-    try reader.seekTo(start_pos);
-    var bytes_skipped: u64 = 0;
+    // Skip to next newline
+    _ = linux.lseek(fd, @intCast(start_pos), linux.SEEK.SET);
+    var bytes_skipped: usize = 0;
+    var c: [1]u8 = undefined;
     while (true) {
-        const char = try reader.interface.takeByte();
+        const read_n = posix.read(fd, &c) catch break;
+        if (read_n == 0) break;
         bytes_skipped += 1;
-        if (char == '\n') break;
+        if (c[0] == '\n') break;
     }
 
     return bytes_skipped;
@@ -200,28 +269,33 @@ fn processBatch(
     start_pos: usize,
     batch_size: u64,
     m: *FastMap,
-    file: std.fs.File,
+    fd: posix.fd_t,
     arena_alloc: std.mem.Allocator,
-) !void {
+) void {
     var processed_bytes: u64 = 0;
     if (thread_idx > 0) {
-        processed_bytes = try skipToNextLine(file, start_pos);
+        processed_bytes = skipToNextLine(fd, start_pos);
     }
 
-    var file_buffer: [8192]u8 = undefined;
-    var reader = file.reader(&file_buffer);
-    try reader.seekTo(start_pos + processed_bytes);
+    var reader = BufferedReader.init(fd, start_pos + processed_bytes);
 
     while (processed_bytes < batch_size) {
-        const line = reader.interface.takeDelimiterExclusive('\n') catch |read_err| {
-            if (read_err == error.EndOfStream) {
-                break;
-            }
-            return read_err;
-        };
+        const line = reader.readLine() orelse break;
 
-        const location_slice, const temperature = try parseLine(line);
-        try m.putOrUpdate(location_slice, temperature, arena_alloc);
+        if (line.len >= 4) {
+            // Semicolon is always at len - 4, len - 5, or len - 6
+            // Temperature format: [-]D[D].D (3-5 chars + semicolon)
+            const len = line.len;
+            const semicol_pos: usize = if (line[len - 4] == ';')
+                len - 4
+            else if (line[len - 5] == ';')
+                len - 5
+            else
+                len - 6;
+
+            const temperature = parse_int(line[semicol_pos + 1 ..]);
+            m.putOrUpdate(line[0..semicol_pos], temperature, arena_alloc) catch {};
+        }
 
         processed_bytes += line.len + 1;
     }
@@ -230,10 +304,36 @@ fn processBatch(
 fn accumulateBatchResults(m: *FastMap, batch_results: *[NUM_THREADS]FastMap) void {
     for (batch_results) |batch_map| {
         for (batch_map.entries) |*entry| {
-            if (entry.freq == 0) continue; // Skip empty entries
+            if (entry.freq == 0) continue;
             m.putOrUpdateEntry(entry);
         }
     }
+}
+
+const ThreadContext = struct {
+    thread_idx: usize,
+    start_pos: usize,
+    batch_size: u64,
+    map: *FastMap,
+    fd: posix.fd_t,
+    allocator: std.mem.Allocator,
+};
+
+fn threadWorker(ctx: *ThreadContext) void {
+    // Pin thread to CPU core (Linux-specific)
+    var cpu_set: linux.cpu_set_t = std.mem.zeroes(linux.cpu_set_t);
+    const cpu_idx = ctx.thread_idx % NUM_THREADS;
+    cpu_set[cpu_idx / 64] |= @as(usize, 1) << @intCast(cpu_idx % 64);
+    linux.sched_setaffinity(0, &cpu_set) catch {};
+
+    processBatch(
+        ctx.thread_idx,
+        ctx.start_pos,
+        ctx.batch_size,
+        ctx.map,
+        ctx.fd,
+        ctx.allocator,
+    );
 }
 
 fn processParallelInMultipleBatches(file_size: u64, file_path: []const u8) !void {
@@ -245,29 +345,34 @@ fn processParallelInMultipleBatches(file_size: u64, file_path: []const u8) !void
     var thread_handles: [NUM_THREADS]std.Thread = undefined;
     var m: [NUM_THREADS]FastMap = undefined;
     var arenas: [NUM_THREADS]std.heap.ArenaAllocator = undefined;
-    var files: [NUM_THREADS]std.fs.File = undefined;
+    var fds: [NUM_THREADS]posix.fd_t = undefined;
+    var contexts: [NUM_THREADS]ThreadContext = undefined;
 
     for (0..NUM_THREADS) |i| {
         arenas[i] = std.heap.ArenaAllocator.init(gpa_alloc);
         m[i] = try FastMap.init(arenas[i].allocator());
-        files[i] = try std.fs.cwd().openFile(file_path, .{});
+        const file = try std.fs.cwd().openFile(file_path, .{});
+        fds[i] = file.handle;
     }
 
     defer {
         for (0..NUM_THREADS) |i| {
             m[i].deinit();
             arenas[i].deinit();
-            files[i].close();
+            posix.close(fds[i]);
         }
     }
 
     for (0..NUM_THREADS) |i| {
-        const start_pos = i * batch_size;
-        thread_handles[i] = try std.Thread.spawn(
-            .{},
-            processBatch,
-            .{ i, @as(usize, start_pos), batch_size, &m[i], files[i], arenas[i].allocator() },
-        );
+        contexts[i] = .{
+            .thread_idx = i,
+            .start_pos = i * batch_size,
+            .batch_size = batch_size,
+            .map = &m[i],
+            .fd = fds[i],
+            .allocator = arenas[i].allocator(),
+        };
+        thread_handles[i] = try std.Thread.spawn(.{}, threadWorker, .{&contexts[i]});
     }
 
     for (0..NUM_THREADS) |i| {
@@ -295,7 +400,7 @@ fn processInSingleBatch(batch_size: u64, file_path: []const u8) !void {
     const file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
 
-    try processBatch(0, 0, batch_size, &m, file, arena_alloc);
+    processBatch(0, 0, batch_size, &m, file.handle, arena_alloc);
     try printResults(&m);
 }
 
@@ -323,4 +428,3 @@ pub fn main() !void {
 
     try onebrc(file_path);
 }
-
