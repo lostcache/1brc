@@ -14,3 +14,5 @@ target
 data
 
 .zig-cache
+_build
+
