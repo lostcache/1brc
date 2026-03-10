@@ -1,0 +1,8 @@
+# Specify the OCamlFormat version
+version = unknown
+
+# Use a specific profile (options include default, ocamlformat, janestreet)
+profile = janestreet
+
+# You can also set individual options
+margin = 100

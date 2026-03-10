@@ -267,6 +267,8 @@ let one_brc file_path =
     process_in_multiple_batches file_path file_size
   )
 
+let () = lol.pli
+
 let () =
   one_brc
     (match Array.length Sys.argv = 2 with
